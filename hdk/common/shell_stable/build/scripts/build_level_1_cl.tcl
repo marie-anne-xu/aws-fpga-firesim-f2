@@ -32,8 +32,30 @@ add_files ${checkpoints_dir}/${CL}.${TAG}.post_synth.dcp
 set_property SCOPED_TO_CELLS {WRAPPER/CL} \
              [get_files ${checkpoints_dir}/${CL}.${TAG}.post_synth.dcp]
 
+# FireSim DFX: link the RM's OOC netlist into its partition and declare it as a
+# nested RP. Paths recorded at synthesis are CL-scoped, so prefix with WRAPPER/CL.
+# This script is shared by every CL, so only engage when the FireSim PR helpers
+# and a recorded partition-path file are both present.
+set pr_rp_cells {}
+set pr_utils     ${CL_DIR}/build/scripts/pr_utils.tcl
+set pr_paths_file ${checkpoints_dir}/${CL}.pr_partition_paths.txt
+if {[file exists $pr_utils] && [file exists $pr_paths_file]} {
+    source $pr_utils
+    lassign [pr_read_paths $pr_paths_file] pr_mods pr_paths
+    for {set i 0} {$i < [llength $pr_paths]} {incr i} {
+        set mod  [lindex $pr_mods $i]
+        set cell WRAPPER/CL/[lindex $pr_paths $i]
+        set rm_dcp ${checkpoints_dir}/${mod}.${TAG}.rm_post_synth.dcp
+        if {![file exists $rm_dcp]} { error "PR: RM checkpoint not found: $rm_dcp" }
+        add_files $rm_dcp
+        set_property SCOPED_TO_CELLS [list $cell] [get_files $rm_dcp]
+        lappend pr_rp_cells $cell
+        puts "PR: linking RM '$mod' into $cell"
+    }
+}
+
 link_design -mode default \
-            -reconfig_partitions {WRAPPER/CL} \
+            -reconfig_partitions [concat {WRAPPER/CL} $pr_rp_cells] \
             -top top
 
 print "Writing post-link design checkpoint"

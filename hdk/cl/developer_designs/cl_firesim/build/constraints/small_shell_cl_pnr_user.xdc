@@ -164,4 +164,3 @@ set_false_path \
               -filter {REF_PIN_NAME == CLK}] \
     -to   [get_cells -hierarchical -filter \
               {NAME =~ WRAPPER/CL/SH_DDR/*rd_do_reg[*]}]
-

@@ -57,7 +57,54 @@ puts "AWS FPGA: ([clock format [clock seconds] -format %T]) Reading developer's 
 # Reading the .sv and .v files, as proper designs would not require reading
 # .vh, nor .inc files
 # read_verilog -sv [glob ${src_post_enc_dir}/*.{s,}v]
-read_verilog -sv [glob ${CL_DIR}/design/*.{s,}v]
+source ${CL_DIR}/build/scripts/pr_utils.tcl
+
+if {[pr_enabled]} {
+    # DFX: the RM must be ABSENT so it elaborates as a black box (synthesized
+    # separately by synth_cl_firesim_rm.tcl). Drop the monolithic
+    # FireSim-generated.sv, which contains it, in favour of split-verilog;
+    # keeping both would duplicate modules and re-introduce the RM.
+    set pr_module_names [pr_split [pr_env FIRESIM_PR_MODULE_NAME]]
+    if {[llength $pr_module_names] == 0} {
+        error "PR: FIRESIM_PR_MODULE_NAME must name the reconfigurable module"
+    }
+    set split_dir ${CL_DIR}/design/split-verilog
+    if {![file isdirectory $split_dir]} {
+        error "PR: split-verilog directory not found: $split_dir\
+               (run 'make replace-rtl' to populate it)"
+    }
+
+    set cl_srcs {}
+    foreach f [glob -nocomplain ${CL_DIR}/design/*.{s,}v] {
+        if {[file tail $f] eq "FireSim-generated.sv"} { continue }
+        lappend cl_srcs $f
+    }
+    # Withhold each RM's RTL and substitute an empty stub. Vivado errors on a
+    # missing module rather than inferring a black box, so the stub supplies the
+    # port list while leaving the cell empty for DFX.
+    set stub_dir ${CL_DIR}/build/pr_stubs
+    file mkdir $stub_dir
+    set excluded 0
+    foreach f [glob -nocomplain -directory $split_dir *.sv] {
+        set mod [file rootname [file tail $f]]
+        if {$mod in $pr_module_names} {
+            puts "PR: withholding [file tail $f] from static synthesis (black box)"
+            lappend cl_srcs [pr_write_stub $f $mod ${stub_dir}/${mod}_stub.v]
+            incr excluded
+            continue
+        }
+        lappend cl_srcs $f
+    }
+    if {$excluded != [llength $pr_module_names]} {
+        error "PR: expected to withhold [llength $pr_module_names] module file(s)\
+               but found $excluded in $split_dir -- check the generated module name."
+    }
+
+    puts "PR: reading [llength $cl_srcs] source file(s) for static synthesis"
+    read_verilog -sv $cl_srcs
+} else {
+    read_verilog -sv [glob ${CL_DIR}/design/*.{s,}v]
+}
 
 #---- End of section replaced by User ----
 
@@ -238,6 +285,21 @@ synth_design -mode out_of_context \
 # puts "\nRunning synth_design for $CL_MODULE $CL_DIR/build/scripts \[[clock format [clock seconds] -format {%a %b %d %H:%M:%S %Y}]\]"
 # eval [concat synth_design -top $CL_MODULE -verilog_define XSDB_SLV_DIS $VDEFINES -part [DEVICE_TYPE] -mode out_of_context $synth_options -directive $synth_directive]
 
+if {[pr_enabled]} {
+    # Confirm the RM is a black box and record where it landed: the user XDC's
+    # HD.RECONFIGURABLE/pblock lines must match, and main_pr_rm.tcl reads it back.
+    set pr_paths [pr_discover_paths $pr_module_names]
+    pr_assert_blackbox $pr_paths
+    pr_report_paths    $pr_paths
+
+    pr_write_paths ${CL_DIR}/build/checkpoints/${CL}.pr_partition_paths.txt \
+                   $pr_module_names $pr_paths
+
+    puts "PR: NOTE -- failfast.csv below cannot see the RM (black box at"
+    puts "PR: synthesis), so AWS's over-utilization gate under-counts. RM area"
+    puts "PR: is checked against its pblock during implementation instead."
+}
+
 set failval [catch {exec grep "FAIL" failfast.csv}]
 if { $failval==0 } {
 	puts "AWS FPGA: FATAL ERROR--Resource utilization error; check failfast.csv for details"
@@ -257,3 +319,28 @@ report_control_sets -verbose -file $CL_DIR/build/reports/${timestamp}.post_synth
 
 # Common footer
 source ${HDK_SHELL_DIR}/build/scripts/synth_cl_footer.tcl
+
+# ---- RM out-of-context synthesis (DFX) ----
+# The footer closed the CL project, so start a fresh in-memory one. Mirrors the
+# per-RM synthesis the article runs before the first configuration; project-mode
+# U250 gets this free from create_reconfig_module.
+if {[pr_enabled]} {
+    foreach mod [pr_split [pr_env FIRESIM_PR_MODULE_NAME]] {
+        puts "PR: out-of-context synthesis of RM '$mod'"
+        create_project -in_memory -part $DEVICE_TYPE -force
+        set_property XPM_LIBRARIES {XPM_CDC XPM_MEMORY XPM_FIFO} [current_project]
+        read_verilog -sv [glob -nocomplain -directory ${CL_DIR}/design/split-verilog *.sv]
+        # OOC timing must come from an xdc read with -mode out_of_context; an
+        # inline create_clock cannot work, as no ports exist before synth_design.
+        set ooc_xdc ${CL_DIR}/build/pr_stubs/${mod}_ooc.xdc
+        set ooc_fh [open $ooc_xdc w]
+        puts $ooc_fh "create_clock -name user_clock -period [expr {1000.0 / [pr_env FIRESIM_PR_FREQUENCY 35]}] \[get_ports clock\]"
+        close $ooc_fh
+        read_xdc -mode out_of_context $ooc_xdc
+        synth_design -mode out_of_context -top $mod -part $DEVICE_TYPE -keep_equivalent_registers
+        set rm_dcp ${checkpoints_dir}/${mod}.${TAG}.rm_post_synth.dcp
+        write_checkpoint -force $rm_dcp
+        puts "PR: wrote RM checkpoint -> $rm_dcp"
+        close_project
+    }
+}
