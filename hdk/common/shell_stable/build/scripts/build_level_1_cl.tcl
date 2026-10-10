@@ -39,7 +39,13 @@ set_property SCOPED_TO_CELLS {WRAPPER/CL} \
 set pr_rp_cells {}
 set pr_utils     ${CL_DIR}/build/scripts/pr_utils.tcl
 set pr_paths_file ${checkpoints_dir}/${CL}.pr_partition_paths.txt
-if {[file exists $pr_utils] && [file exists $pr_paths_file]} {
+set pr_nested_parent 0
+if {[info exists ::env(FIRESIM_PR_NESTED_PARENT)]} {
+    set pr_nested_parent [expr {$::env(FIRESIM_PR_NESTED_PARENT) eq "1"}]
+}
+# The nested parent already contains its independently synthesized RM. Keep
+# only the outer CL partition active until pr_subdivide transfers it inward.
+if {!$pr_nested_parent && [file exists $pr_utils] && [file exists $pr_paths_file]} {
     source $pr_utils
     lassign [pr_read_paths $pr_paths_file] pr_mods pr_paths
     for {set i 0} {$i < [llength $pr_paths]} {incr i} {
@@ -79,6 +85,11 @@ read_xdc ${constraints_dir}/${SHELL_MODE}_cl_pnr_user.xdc
 
 # Optional, MIG placement training
 source ${HDK_SHELL_DIR}/build/scripts/ddr_io_train.tcl
+
+# Keep static logic out of the future child region during pass one.
+if {$pr_nested_parent} {
+    source ${CL_DIR}/build/scripts/pr_seed_reservation.tcl
+}
 
 # # MMCM cascade placement constraint
 # read_xdc ${HDK_SHELL_DESIGN_DIR}/../build/constraints/mmcm_cascade.xdc

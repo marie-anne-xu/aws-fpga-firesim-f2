@@ -338,9 +338,43 @@ if {[pr_enabled]} {
         close $ooc_fh
         read_xdc -mode out_of_context $ooc_xdc
         synth_design -mode out_of_context -top $mod -part $DEVICE_TYPE -keep_equivalent_registers
+        pr_fix_constant_output_drivers
         set rm_dcp ${checkpoints_dir}/${mod}.${TAG}.rm_post_synth.dcp
         write_checkpoint -force $rm_dcp
         puts "PR: wrote RM checkpoint -> $rm_dcp"
         close_project
     }
+}
+
+# The outer AWS partition must contain a complete CL for its first routed
+# configuration. Assemble independently synthesized RMs into the static CL,
+# preserving their RTL interfaces through outer-RP implementation. The child
+# becomes HD.RECONFIGURABLE only when main_pr_subdivide.tcl subdivides CL.
+if {[pr_enabled] && [pr_env FIRESIM_PR_NESTED_PARENT 0] eq "1"} {
+    set static_dcp ${checkpoints_dir}/${CL}.${TAG}.post_synth.dcp
+    set static_only_dcp ${checkpoints_dir}/${CL}.${TAG}.static_post_synth.dcp
+    file copy -force $static_dcp $static_only_dcp
+    # Assemble with scoped netlist linking. In Vivado 2025.2, direct
+    # read_checkpoint -cell into this OOC CL checkpoint returns Project 1-9.
+    # Linking preserves the OOC mode inherited from the static checkpoint.
+    create_project -in_memory -part $DEVICE_TYPE -force
+    lassign [pr_read_paths ${CL_DIR}/build/checkpoints/${CL}.pr_partition_paths.txt] \
+        pr_module_names pr_paths
+    foreach mod $pr_module_names path $pr_paths {
+        set rm_dcp ${checkpoints_dir}/${mod}.${TAG}.rm_post_synth.dcp
+        puts "PR: assembling independently synthesized '$mod' at '$path'"
+        add_files $rm_dcp
+        set_property SCOPED_TO_CELLS [list $path] [get_files $rm_dcp]
+    }
+    add_files $static_only_dcp
+    link_design -top cl_firesim -part $DEVICE_TYPE
+    foreach path $pr_paths {
+        set_property DONT_TOUCH true [get_cells $path]
+        if {[get_property IS_BLACKBOX [get_cells $path]]} {
+            error "PR: RM assembly left '$path' as a black box"
+        }
+    }
+    write_checkpoint -force $static_dcp
+    close_project
+    puts "PR: populated outer-CL synthesis checkpoint: $static_dcp"
 }

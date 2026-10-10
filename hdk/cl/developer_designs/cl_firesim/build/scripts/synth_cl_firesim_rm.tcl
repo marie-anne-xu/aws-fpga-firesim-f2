@@ -77,6 +77,8 @@ synth_design -mode out_of_context \
              -part $DEVICE_TYPE \
              -keep_equivalent_registers
 
+pr_fix_constant_output_drivers
+
 set out_dcp ${checkpoints_dir}/${PR_MODULE}.${TAG}.rm_post_synth.dcp
 puts "PR: writing RM checkpoint: $out_dcp"
 write_checkpoint -force $out_dcp

@@ -167,16 +167,43 @@ proc pr_read_paths {path_file} {
     return [list $modules $paths]
 }
 
-# Pre-submission gate. With no local write_bitstream, route status is the only
-# check before a multi-hour AFI bake.
+# Route-completeness gate. Static compatibility is checked separately by
+# pr_verify. INTRASITE, NOLOADS, and HIERPORT require no inter-site routing
+# (Vivado 2025.2 report_route_status reference).
 proc pr_check_routed {label} {
     puts "PR: route status after ${label}:"
-    report_route_status
+    report_route_status -ignore_cache
     set unrouted [get_nets -quiet -hierarchical \
-                    -filter {ROUTE_STATUS != INTRACT && ROUTE_STATUS != ROUTED}]
+                    -filter {ROUTE_STATUS != INTRASITE && ROUTE_STATUS != ROUTED && ROUTE_STATUS != NOLOADS && ROUTE_STATUS != HIERPORT}]
     if {[llength $unrouted] > 0} {
         error "PR: [llength $unrouted] net(s) not fully routed after ${label};\
                refusing to ship this DCP"
     }
     puts "PR: fully routed after ${label}"
+}
+
+# Give constant RM output bits distinct preserved drivers (UG909 unique-driver
+# requirement). Run on the standalone OOC RM before writing its checkpoint.
+proc pr_fix_constant_output_drivers {} {
+    set index 0
+    foreach port [get_ports -filter {DIRECTION == OUT}] {
+        set net [get_nets -quiet -of_objects $port]
+        set drivers [get_pins -quiet -leaf -of_objects $net -filter {DIRECTION == OUT}]
+        if {[llength $drivers] != 1} {continue}
+        set ref [get_property REF_NAME [get_cells -of_objects $drivers]]
+        if {$ref ni {GND VCC}} {continue}
+        set name dfx_output_constant_$index
+        if {[llength [get_cells -quiet $name]]} {error "PR: reserved output driver name already exists: $name"}
+        create_cell -reference LUT1 $name
+        set_property INIT [expr {$ref eq "GND" ? "2'h0" : "2'h3"}] [get_cells $name]
+        set_property DONT_TOUCH true [get_cells $name]
+        connect_net -net $net -objects [get_pins $name/I0]
+        disconnect_net -net $net -objects $port
+        create_net ${name}_net
+        connect_net -net [get_nets ${name}_net] -objects [list $port [get_pins $name/O]]
+        puts "PR: unique constant output driver: $port -> $name/O ($ref)"
+        incr index
+    }
+    puts "PR: created $index distinct constant RM output drivers"
+    return $index
 }
