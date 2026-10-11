@@ -1,156 +1,156 @@
 # =============================================================================
 # PARENT pass 2/2 -- nested DFX via pr_subdivide (AWS F2).
-
-# UG909 describes nested DFX as "step and repeat through hierarchy": pass 1 is a
-# outer-RP fully-routed build, pass 2 subdivides. pr_subdivide moves
-# HD.RECONFIGURABLE from WRAPPER/CL down to the RM and marks WRAPPER/CL as
-# HD.RECONFIGURABLE_CONTAINER -- which is why declaring both as RPs in one
-# link_design fails DRC HDPR-13.
-
-# It internally runs update_design -black_box, lock_design -level routing, and
-# loads the CL post-synth netlist, so none of those are done by hand here.
-
+#
+# UG909 nested DFX is "step and repeat through hierarchy": pass 1 is a normal,
+# fully routed outer-RP build with the child region reserved
+# (pr_seed_reservation.tcl). Pass 2 moves HD.RECONFIGURABLE from WRAPPER/CL
+# down to the child and marks WRAPPER/CL HD.RECONFIGURABLE_CONTAINER. Declaring
+# both as RPs in one link_design fails DRC HDPR-13.
+#
+# Validated recipe (trial g9_cell_const_unroute), see pr_nested_impl.tcl:
+#   a. export the placed+routed WRAPPER/CL from pass 1, pblocks stripped and
+#      GND/VCC unrouted
+#   b. AWS shell + lock_design -level routing + pr_subdivide from that placed
+#      cell. SH_DDR stays placed; there is no MIG regeneration and no opt_design.
+#   c. freeze all static logic; place and route only the RP and its boundary.
+#
 #   vivado -mode batch -source main_pr_subdivide.tcl -tclargs \
 #     --cl_dir <dir> --build_tag <tag> --pr_module_name <mod> \
-#     [--cl_name <name>] [--pblock_region <CLOCKREGION_..:CLOCKREGION_..>]
+#     [--cl_name <name>] [--pblock_region <ranges>] [--clock_recipes A,B,C,HBM]
 #     [--output_dir <dir>]  (defaults to the build checkpoints directory)
+# The child region is the one pass 1 reserved (pblock_prefetcher_seed in the
+# routed parent). --pblock_region is only cross-checked against it.
 # =============================================================================
 
 set script_start_time [clock seconds]
 set scripts_dir [file dirname [file normalize [info script]]]
 source ${scripts_dir}/pr_utils.tcl
 source ${scripts_dir}/pr_ddr_placement.tcl
+source ${scripts_dir}/pr_nested_impl.tcl
 
 set opts [pr_parse_args $argv {cl_dir build_tag pr_module_name} {cl_name pblock_region clock_recipes output_dir}]
 set CL_DIR    [dict get $opts cl_dir]
 set TAG       [dict get $opts build_tag]
 set PR_MODULE [dict get $opts pr_module_name]
 set CL        [pr_opt $opts cl_name cl_firesim]
-# Four clock regions in lower-left SLR2, near the prefetcher's original location.
-# The current routed parent has zero DDR placements and fixed shell sites in
-# this region, with 7,440 usable slice sites. Whole-region boundaries support
-# SNAPPING_MODE; RESET_AFTER_RECONFIG is not supported on this device.
-# --pblock_region overrides this (build-bitstream.sh passes PR_PBLOCK_REGION).
-set REGION [list [pr_opt $opts pblock_region {CLOCKREGION_X1Y8:CLOCKREGION_X2Y9}]]
 
 set checkpoints_dir ${CL_DIR}/build/checkpoints
 set reports_dir     ${CL_DIR}/build/reports
+set constraints_dir ${CL_DIR}/build/constraints
 set output_dir [pr_opt $opts output_dir $checkpoints_dir]
-file mkdir $output_dir
+file mkdir $output_dir $reports_dir
 
-# Pass 1's CL routing is discarded by pr_subdivide, so its timing does not
-# matter -- accept the VIOLATED name too. Only pass 2's result becomes the base.
+set HDK_SHELL_DIR [pr_env HDK_SHELL_DIR]
+set SHELL_MODE    [pr_env SHELL_MODE small_shell]
+if {$HDK_SHELL_DIR eq ""} { error "PR: HDK_SHELL_DIR not set (source hdk_setup.sh)" }
+set shell_dcp ${HDK_SHELL_DIR}/build/checkpoints/from_aws/cl_bb_routed.${SHELL_MODE}.dcp
+
+# Pass 1's placement and routing are reused for all static CL logic, so its
+# timing carries into the nested base. A VIOLATED parent is still accepted
+# here; the final timing gate decides.
 set routed_dcp ${checkpoints_dir}/${CL}.${TAG}.post_route.dcp
 if {![file exists $routed_dcp]} {
     set violated ${checkpoints_dir}/${CL}.${TAG}.post_route.VIOLATED.dcp
     if {[file exists $violated]} {
-        puts "PR: pass 1 missed timing; using $violated (its routing is discarded anyway)"
+        puts "PR: pass 1 missed timing; reusing $violated (static timing carries over)"
         set routed_dcp $violated
     } else {
         error "PR: no pass-1 routed checkpoint in $checkpoints_dir"
     }
 }
-set cl_synth ${checkpoints_dir}/${CL}.${TAG}.post_synth.dcp
-if {![file exists $cl_synth]} { error "PR: pass-1 CL netlist missing: $cl_synth" }
+foreach f [list $routed_dcp $shell_dcp] {
+    if {![file exists $f]} { error "PR: missing input checkpoint $f" }
+}
 
-puts "PR: opening pass-1 routed checkpoint"
+# ---- a. clean placed CL cell from the routed parent --------------------------
+puts "PR: opening pass-1 routed checkpoint $routed_dcp"
 open_checkpoint $routed_dcp
 
-# The RM must exist as populated hierarchy in the routed outer-CL design.
-# Parent synthesis assembles it from its independent OOC checkpoint to preserve
-# the interface. Discover its full path (already WRAPPER/CL-prefixed here).
 set rp_cells [get_cells -hierarchical -filter "REF_NAME == $PR_MODULE" -quiet]
 if {[llength $rp_cells] != 1} {
     error "PR: expected exactly 1 instance of '$PR_MODULE', found [llength $rp_cells]"
 }
 set rp_path [get_property NAME [lindex $rp_cells 0]]
+if {[regexp {[][*?\\]} $rp_path]} { error "PR: RP path contains glob characters: $rp_path" }
 puts "PR: subdividing WRAPPER/CL -> $rp_path"
 
-# UG909 2025.2: pr_subdivide reloads a synthesized parent RM. Capture the
-# package-pin-dependent DDR primitives before it discards the parent placement.
-set ddr_placement [pr_capture_ddr_placement]
-# read_checkpoint inside pr_subdivide invalidates Vivado object-valued Tcl
-# variables (Vivado 12-12435). Serialize the capture so names and sites are
-# restored as plain strings, independent of the old design database.
-set ddr_placement_file ${output_dir}/${CL}.${TAG}.ddr_phy_placement.tcl
-set ddr_placement_fh [open $ddr_placement_file w]
-puts $ddr_placement_fh [list set ddr_placement $ddr_placement]
-close $ddr_placement_fh
-pr_subdivide -cell WRAPPER/CL -subcells [list $rp_path] $cl_synth
-source $ddr_placement_file
+# The static routes were built around pass 1's reservation, so the child goes
+# exactly there.
+set seed_pb [get_pblocks -quiet pblock_prefetcher_seed]
+if {[llength $seed_pb] != 1} { error "PR: pass-1 parent has no pblock_prefetcher_seed reservation" }
+set REGION [get_property GRID_RANGES $seed_pb]
+set requested [pr_opt $opts pblock_region ""]
+if {$requested ne "" && $requested ne $REGION} {
+    puts "PR: NOTE --pblock_region $requested ignored; pass 1 reserved $REGION"
+}
+puts "PR: child region = $REGION"
+set rp_placed [llength [get_cells -quiet -hierarchical -filter "IS_PRIMITIVE && STATUS != UNPLACED && NAME =~ $rp_path/*"]]
+puts "PR: parent RP primitives placed=$rp_placed"
 
-# Re-apply CL implementation constraints after the synthesized netlist reload.
-set HDK_SHELL_DIR [pr_env HDK_SHELL_DIR]
-set SHELL_MODE    [pr_env SHELL_MODE small_shell]
-if {$HDK_SHELL_DIR eq ""} { error "PR: HDK_SHELL_DIR not set (source hdk_setup.sh)" }
+set cell_dcp  ${output_dir}/${CL}.${TAG}.pr_cl_cell.dcp
+set clean_dcp ${output_dir}/${CL}.${TAG}.pr_cl_clean.dcp
+pr_write_clean_cl_cell $cell_dcp $clean_dcp
 
-# aws_clock_properties.tcl reads these as globals; build_all.tcl sets them from
-# argv in pass 1 (:134-137), but pass 2 is a standalone vivado invocation.
+# ---- b. subdivide inside the locked AWS shell --------------------------------
+puts "PR: opening AWS shell $shell_dcp"
+open_checkpoint $shell_dcp
+lock_design -level routing
+pr_subdivide -cell WRAPPER/CL -subcells [list $rp_path] $clean_dcp
+if {![get_property HD.RECONFIGURABLE_CONTAINER [get_cells WRAPPER/CL]] || ![get_property HD.RECONFIGURABLE [get_cells $rp_path]]} {
+    error "PR: pr_subdivide did not produce WRAPPER/CL container + RP $rp_path"
+}
+puts "PR: subdivided in [expr {[clock seconds] - $script_start_time}]s"
+
+# Re-apply CL implementation constraints. aws_clock_properties.tcl reads the
+# recipes as globals (build_all.tcl sets them from argv in pass 1).
 lassign [pr_split [pr_opt $opts clock_recipes "A1,B0,C0,H2"]] \
         clock_recipe_a clock_recipe_b clock_recipe_c clock_recipe_hbm
 puts "PR: clock recipes = $clock_recipe_a $clock_recipe_b $clock_recipe_c $clock_recipe_hbm"
-
-puts "PR: re-applying clock properties"
 source ${HDK_SHELL_DIR}/build/scripts/aws_clock_properties.tcl
-
-# Do not replay the OOC generated clocks at device scope (clk_main_a0 is a CL
-# boundary pin). Carving an RM clears its embedded I/O constraints, so apply
-# package pins before optimization so the I/O macros are expanded consistently.
-puts "PR: applying embedded DDR package-pin constraints before optimization"
 read_xdc ${HDK_SHELL_DIR}/build/constraints/cl_pins.xdc
-# Scope CL timing constraints by instance, not the output artifact filename.
-puts "PR: re-applying CL-scoped timing constraints"
 read_xdc -cells [get_cells WRAPPER/CL] ${HDK_SHELL_DIR}/build/constraints/cl_ddr_timing_aws.xdc
-
-puts "PR: re-applying floorplan constraints"
 read_xdc ${HDK_SHELL_DIR}/build/constraints/${SHELL_MODE}_level_1_fp_cl.xdc
-read_xdc ${CL_DIR}/build/constraints/${SHELL_MODE}_cl_pnr_user.xdc
-
-# Retain AWS's DDR timing-oriented placement policy for the nested parent.
+read_xdc ${constraints_dir}/${SHELL_MODE}_cl_pnr_user.xdc
 source ${HDK_SHELL_DIR}/build/scripts/ddr_io_train.tcl
-
-# Package pins anchor I/O buffers. Keep the captured PHY placements for
-# diagnostics; replaying leaf LOC/BEL constraints breaks expanded I/O shapes.
-
-# Carve the RP region out of the SLR grouping pblocks so the only pblock that
-# geometrically encloses the RP is its true container, pblock_CL. Otherwise
-# Vivado attributes the RP to the enclosing grouping pblock (DRC HDPR-2).
-foreach rng $REGION {
-    foreach grp {pblock_CL_SLR0 pblock_CL_SLR1 pblock_CL_SLR2} {
-        if {[llength [get_pblocks -quiet $grp]] > 0} {
-            resize_pblock $grp -remove $rng
-        }
-    }
+# Shell SPI port delays and the clk_core/clk_spi async group from the shell's
+# top_late.xdc are present in the routed parent but absent after subdivision.
+read_xdc ${constraints_dir}/pr_nested_shell_timing.xdc
+foreach clk {clk_core clk_spi} {
+    if {![llength [get_clocks -quiet $clk]]} { puts "PR: NOTE shell clock $clk not found; SPI timing parity incomplete" }
 }
 
-# Floorplan the new child RP. Parent is ROOT (DRC HDPR-2); EXCLUDE_PLACEMENT and
-# CONTAIN_ROUTING are required on a reconfigurable cell's pblock.
-create_pblock pblock_pr_region_0
-foreach rng $REGION {
-    puts "PR:   region += $rng"
-    resize_pblock pblock_pr_region_0 -add $rng
-}
-set_property SNAPPING_MODE ON        [get_pblocks pblock_pr_region_0]
-set_property EXCLUDE_PLACEMENT true  [get_pblocks pblock_pr_region_0]
-set_property CONTAIN_ROUTING true    [get_pblocks pblock_pr_region_0]
-add_cells_to_pblock pblock_pr_region_0 [get_cells $rp_path] -clear_locs
+# ---- c. freeze static, implement the RP only ---------------------------------
+set rp_pblock [pr_make_rp_pblock $rp_path $REGION]
+pr_lock_static_lut_pins $rp_path
+pr_lock_ddr_placement
+pr_unplace_partial_macros $rp_path
+pr_lock_static_except_rp $rp_path
+pr_set_partpin_ranges $rp_path $rp_pblock
+pr_check_ddr_anchors pre_place
 
-write_checkpoint -force ${output_dir}/${CL}.${TAG}.pr_subdivide.pre_opt.dcp
-opt_design
-write_checkpoint -force ${output_dir}/${CL}.${TAG}.pr_subdivide.post_opt.dcp
-# Let placement construct the physical I/O shapes from the early package-pin
-# constraints. Do not replay independent DDR leaf placements after expansion.
 write_checkpoint -force ${output_dir}/${CL}.${TAG}.pr_subdivide.pre_place.dcp
+# No opt_design: it regenerates the MIG and unplaces the DDR PHY.
 place_design
 write_checkpoint -force ${output_dir}/${CL}.${TAG}.pr_subdivide.post_place.dcp
-phys_opt_design
-route_design -tns_cleanup
+pr_check_placed post_place
+pr_check_ddr_anchors post_place
 
-pr_check_routed "pr_subdivide implementation"
+# Route and gate; on any failure keep the design for debugging.
+if {[catch {
+    pr_route_rp $rp_path $rp_pblock
 
-report_utilization -cells [get_cells $rp_path] \
-                   -file ${reports_dir}/${CL}.${TAG}.pr_subdivide_utilization.rpt
-report_timing_summary -file ${reports_dir}/${CL}.${TAG}.pr_subdivide_timing.rpt
+    report_utilization -cells [get_cells $rp_path] \
+                       -file ${reports_dir}/${CL}.${TAG}.pr_subdivide_utilization.rpt
+    report_timing_summary -file ${reports_dir}/${CL}.${TAG}.pr_subdivide_timing.rpt
+    report_route_status -file ${reports_dir}/${CL}.${TAG}.pr_subdivide_route_status.rpt
+    pr_check_routed "pr_subdivide implementation"
+    pr_check_ddr_anchors post_route
+    pr_check_hdpr_drc "pr_subdivide implementation" ${reports_dir}/${CL}.${TAG}.pr_subdivide_hdpr_drc.rpt
+    pr_check_timing_met "pr_subdivide implementation"
+} gate_err]} {
+    write_checkpoint -force ${output_dir}/${CL}.${TAG}.pr_subdivide.post_route.FAILED.dcp
+    error $gate_err
+}
 
 # Overwrite pass 1's checkpoint: this is the real base, with the RM as an RP.
 set nested_dcp ${output_dir}/${CL}.${TAG}.post_route.dcp

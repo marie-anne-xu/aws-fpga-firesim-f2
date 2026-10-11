@@ -167,19 +167,85 @@ proc pr_read_paths {path_file} {
     return [list $modules $paths]
 }
 
-# Route-completeness gate. Static compatibility is checked separately by
-# pr_verify. INTRASITE, NOLOADS, and HIERPORT require no inter-site routing
-# (Vivado 2025.2 report_route_status reference).
+# Route-completeness gate, parsed from report_route_status (the same counts the
+# validated nested trial was gated on). A per-net ROUTE_STATUS scan is not used:
+# in an abstract-shell (nested container) design it reports hierarchical
+# segments that report_route_status does not count. Zero-count lines are
+# omitted from the report, so a missing line means zero.
 proc pr_check_routed {label} {
     puts "PR: route status after ${label}:"
-    report_route_status -ignore_cache
-    set unrouted [get_nets -quiet -hierarchical \
-                    -filter {ROUTE_STATUS != INTRASITE && ROUTE_STATUS != ROUTED && ROUTE_STATUS != NOLOADS && ROUTE_STATUS != HIERPORT}]
-    if {[llength $unrouted] > 0} {
-        error "PR: [llength $unrouted] net(s) not fully routed after ${label};\
+    set st [report_route_status -ignore_cache -return_string]
+    puts $st
+    set errors 0
+    set unrouted 0
+    regexp {# of nets with routing errors\.*\s*:\s*(\d+)} $st -> errors
+    regexp {# of unrouted nets\.*\s*:\s*(\d+)} $st -> unrouted
+    if {$errors > 0 || $unrouted > 0} {
+        error "PR: ${label}: $errors net(s) with routing errors, $unrouted unrouted;\
                refusing to ship this DCP"
     }
     puts "PR: fully routed after ${label}"
+}
+
+# Setup and hold must both close; a nested base that misses timing is not shipped.
+proc pr_check_timing_met {label} {
+    set wns [get_property SLACK [get_timing_paths -max_paths 1 -nworst 1 -setup]]
+    set whs [get_property SLACK [get_timing_paths -max_paths 1 -nworst 1 -hold]]
+    puts "PR: timing after ${label}: WNS=$wns WHS=$whs"
+    foreach {name v} [list WNS $wns WHS $whs] {
+        if {$v ne "" && [string is double -strict $v] && $v < 0} {
+            error "PR: ${label} fails timing ($name=$v)"
+        }
+    }
+}
+
+# DFX DRC gate: fail on any HDPR rule reported at Error or Critical Warning.
+proc pr_check_hdpr_drc {label rpt} {
+    set checks [get_drc_checks -quiet HDPR-*]
+    if {![llength $checks]} { error "PR: no HDPR DRC checks available" }
+    set txt [report_drc -checks $checks -return_string]
+    set fh [open $rpt w]; puts $fh $txt; close $fh
+    set bad {}
+    foreach line [split $txt "\n"] {
+        if {[regexp {^\|\s*(HDPR-\d+)\s*\|\s*([^|]*?)\s*\|.*\|\s*(\d+)\s*\|\s*$} $line -> rule sev n]} {
+            puts "PR: ${label} DRC $rule ($sev): $n"
+            if {$n > 0 && [regexp -nocase {error|critical} $sev]} { lappend bad "$rule=$n" }
+        }
+    }
+    if {[llength $bad]} { error "PR: ${label} HDPR DRC violations: $bad (see $rpt)" }
+    puts "PR: ${label} HDPR DRC clean ($rpt)"
+}
+
+# Nested child region. The validated base (trial g9_cell_const_unroute) uses two
+# whole clock regions in SLR0. FIRESIM_PR_NESTED_REGION overrides it.
+# platforms/f2/build-bitstream.sh still exports the superseded SLR2 default as
+# PR_PBLOCK_REGION, so that variable does not choose the nested-parent region.
+proc pr_nested_region {} {
+    return [pr_env FIRESIM_PR_NESTED_REGION {CLOCKREGION_X1Y0:CLOCKREGION_X2Y0}]
+}
+
+# Pass-1 guard on the child reservation: the slices must lie inside pblock_CL,
+# within one SLR, and must not hold shell or SH_DDR cells.
+proc pr_check_seed_region {pblock {min_slices 3000}} {
+    set pb [get_pblocks $pblock]
+    set allowed [dict create]
+    foreach site [get_sites -of_objects [get_pblocks pblock_CL]] {dict set allowed [get_property NAME $site] 1}
+    set slrs [dict create]
+    set n 0
+    foreach site [get_sites -of_objects $pb -filter {SITE_TYPE =~ SLICE*}] {
+        set name [get_property NAME $site]
+        incr n
+        if {![dict exists $allowed $name]} { error "PR seed: region leaves the AWS CL at $name" }
+        dict set slrs [get_property NAME [get_slrs -of_objects $site]] 1
+        foreach occupant [get_cells -quiet -of_objects $site] {
+            set o [get_property NAME $occupant]
+            if {![string match WRAPPER/CL/* $o]} { error "PR seed: region overlaps shell cell $o" }
+            if {[string match WRAPPER/CL/SH_DDR/* $o]} { error "PR seed: region overlaps DDR cell $o" }
+        }
+    }
+    if {[dict size $slrs] != 1} { error "PR seed: region spans SLRs [dict keys $slrs]" }
+    if {$n < $min_slices} { error "PR seed: region has only $n slice sites (< $min_slices)" }
+    puts "PR seed: region guard passed: slices=$n slr=[dict keys $slrs] ranges=[get_property GRID_RANGES $pb]"
 }
 
 # Give constant RM output bits distinct preserved drivers (UG909 unique-driver
