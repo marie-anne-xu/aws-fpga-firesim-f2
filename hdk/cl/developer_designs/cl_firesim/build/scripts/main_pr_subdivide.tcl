@@ -153,6 +153,8 @@ if {[catch {
 }
 
 # Overwrite pass 1's checkpoint: this is the real base, with the RM as an RP.
+# BOOTFIX: never ship a base whose DDR calibration BRAM is empty.
+pr_require_mig_bram "nested base"
 set nested_dcp ${output_dir}/${CL}.${TAG}.post_route.dcp
 puts "PR: writing subdivided base checkpoint: $nested_dcp"
 write_checkpoint -force $nested_dcp

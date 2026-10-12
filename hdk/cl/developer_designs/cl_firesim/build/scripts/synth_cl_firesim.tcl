@@ -368,6 +368,17 @@ if {[pr_enabled] && [pr_env FIRESIM_PR_NESTED_PARENT 0] eq "1"} {
     }
     add_files $static_only_dcp
     link_design -top cl_firesim -part $DEVICE_TYPE
+    # BOOTFIX: with the RM black-boxed during static synthesis, synth_design skips
+    # loading calibration_ddr.elf into the DDR calibration MicroBlaze BRAMs (no
+    # "Memdata 28-144"; AWS check_ddr_bram.tcl: "MiG BRAM is not populated ...
+    # Calibration Failure"), and link_design of DCPs does not populate them
+    # either (trial bf1b). The DDR then never calibrates, ddr_ready stays 0 and
+    # firesim_top is held in reset (driver hangs in wait_for_init). Replay the
+    # INIT/INITP values the ELF produces (taken from the booting flat build; same
+    # AWS cl_ddr4 IP and ELF; validated by trial bf4_mig_init_replay).
+    source ${CL_DIR}/build/scripts/mig_calib_bram_init.tcl
+    pr_apply_mig_bram_init
+    pr_require_mig_bram "assembled outer-CL netlist"
     foreach path $pr_paths {
         set_property DONT_TOUCH true [get_cells $path]
         if {[get_property IS_BLACKBOX [get_cells $path]]} {

@@ -56,6 +56,8 @@ puts "PR: cleared $cleared stale partition-pin properties on former nested RP pi
 pr_check_routed "recombined AWS export"
 pr_check_timing_met "recombined AWS export"
 pr_check_hdpr_drc "recombined AWS export" [file rootname $output_dcp].hdpr_drc.rpt
+# BOOTFIX: never ship an AFI whose DDR calibration BRAM is empty.
+pr_require_mig_bram "recombined AWS export"
 write_checkpoint -force $output_dcp
 close_design
 

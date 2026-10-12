@@ -35,6 +35,8 @@ set clock_period_ns [expr {1000.0 / double($PR_FREQ_MHZ)}]
 set checkpoints_dir ${CL_DIR}/build/checkpoints
 set reports_dir     ${CL_DIR}/build/reports
 set split_dir       ${CL_DIR}/design/split-verilog
+# Child builds run in a fresh CL dir; build/reports does not exist yet (bfc_child_ampm: Common 17-37).
+file mkdir $checkpoints_dir $reports_dir
 
 puts "PR: RM out-of-context synthesis"
 puts "PR:   module      : $PR_MODULE"

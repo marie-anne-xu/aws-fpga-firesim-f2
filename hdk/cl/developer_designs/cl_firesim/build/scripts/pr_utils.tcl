@@ -273,3 +273,20 @@ proc pr_fix_constant_output_drivers {} {
     puts "PR: created $index distinct constant RM output drivers"
     return $index
 }
+
+# BOOTFIX gate: same cell/property as AWS check_ddr_bram.tcl, but fatal.
+proc pr_require_mig_bram {label {fatal 1}} {
+    set ram [get_cells -quiet -hierarchical -filter {NAME=~*mcs0/inst/lmb_bram_I/U0/inst_blk_mem_gen/gnbram.gnative_mem_map_bmg.native_mem_map_blk_mem_gen/valid.cstr/ramloop[0].ram.r/prim_noinit.ram/DEVICE_8SERIES.WITH_BMM_INFO.TRUE_DP.SIMPLE_PRIM36.SERIES8_TDP_SP36_NO_ECC_ATTR.ram}]
+    if {[llength $ram] == 0} { error "PR: $label: DDR calibration BRAM not found" }
+    set v [get_property INIT_2C [lindex $ram 0]]
+    regsub -all {[0-9]+'h} $v {} hex
+    if {![regexp {[1-9a-fA-F]} $hex]} {
+        set msg "PR: $label: MiG BRAM not populated with calibration_ddr.elf (INIT_2C=$v); DDR would not calibrate on F2"
+        if {$fatal} { error $msg }
+        puts "CRITICAL WARNING: $msg"
+        return 0
+    }
+    puts "PR: $label: MiG BRAM is initialized. INIT_2C = $v"
+    return 1
+}
+
