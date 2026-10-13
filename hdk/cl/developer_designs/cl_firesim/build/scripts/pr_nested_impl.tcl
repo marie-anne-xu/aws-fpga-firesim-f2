@@ -227,6 +227,119 @@ proc pr_const_rp_repair {rp pblock label} {
     puts "PR: $label unrouted [llength $bad] static constant nets for re-route outside the RP"
 }
 
+# ---- static GND loads on the RP boundary ------------------------------------
+# A static load tied to GND right outside the RP (e.g. an unused LUTRAM DI in the
+# first static column) may have taken its pass-1 GND tie-off from an unused LUT
+# inside the then-empty reserved region. After pr_subdivide static routing may not
+# enter the RP, and with every static route fixed all static-side entries to that
+# pin can be taken (Route 35-534/35-7 "GNDNet ... unroutable pin"; SLR2 region
+# X1Y8:X2Y8, SLICE_X95Y529/H_I). For each such load whose site pin has no free
+# static-side path two hops up, unroute only the static nets holding its first-hop
+# nodes and unfix the static nets on nearby static INT tiles. Nets that touch any
+# RP-region INT tile are not unfixed in the wider window (a +/-6 window that reached
+# into the RP left ~9.5k overlaps in rgfix_window); the few first-hop holders are
+# unrouted even if their fixed pass-1 route enters the RP box (rgfix_edge2: all 5
+# holders at SLICE_X95Y529 arrive via INT_X59, so excluding them released nothing).
+proc pr_rp_int_box {pblock} {
+    set xs {}; set ys {}
+    foreach t [get_tiles -quiet -of_objects [get_sites -quiet -of_objects [get_pblocks $pblock]]] {
+        if {[regexp {_X(\d+)Y(\d+)$} [get_property NAME $t] -> x y]} { lappend xs $x; lappend ys $y }
+    }
+    return [list [tcl::mathfunc::min {*}$xs] [tcl::mathfunc::max {*}$xs] [tcl::mathfunc::min {*}$ys] [tcl::mathfunc::max {*}$ys]]
+}
+proc pr_in_box {name box} {
+    lassign $box x0 x1 y0 y1
+    if {![regexp {^INT_X(\d+)Y(\d+)$} $name -> x y]} { return 0 }
+    return [expr {$x >= $x0 && $x <= $x1 && $y >= $y0 && $y <= $y1}]
+}
+proc pr_net_touches_box {n box} {
+    foreach t [get_tiles -quiet -of_objects [get_nodes -quiet -of_objects $n] -filter {TYPE =~ INT*}] {
+        if {[pr_in_box [get_property NAME $t] $box]} { return 1 }
+    }
+    return 0
+}
+proc pr_releasable {nets rp box {check_box 1}} {
+    set sel {}; set seen [dict create]
+    foreach n $nets {
+        set nm [get_property NAME $n]
+        if {[dict exists $seen $nm]} continue
+        dict set seen $nm 1
+        if {![string match WRAPPER/CL/* $nm] || [string match WRAPPER/CL/SH_DDR/* $nm] || [string match $rp/* $nm]} continue
+        if {[get_property -quiet TYPE $n] in {GLOBAL_CLOCK POWER GROUND}} continue
+        if {$check_box && [pr_net_touches_box $n $box]} continue
+        lappend sel $n
+    }
+    return $sel
+}
+proc pr_release_rp_edge_gnd {rp pblock {band 2} {fx 2} {fy 4}} {
+    set t0 [clock seconds]
+    set box [pr_rp_int_box $pblock]
+    set xs {}; set ys {}
+    foreach s [get_sites -quiet -of_objects [get_pblocks $pblock] -filter {SITE_TYPE =~ SLICE*}] {
+        if {[regexp {SLICE_X(\d+)Y(\d+)} [get_property NAME $s] -> x y]} { lappend xs $x; lappend ys $y }
+    }
+    set x0 [tcl::mathfunc::min {*}$xs]; set x1 [tcl::mathfunc::max {*}$xs]
+    set y0 [tcl::mathfunc::min {*}$ys]; set y1 [tcl::mathfunc::max {*}$ys]
+    set names {}
+    for {set y [expr {$y0-$band}]} {$y <= $y1+$band} {incr y} {
+        for {set d 1} {$d <= $band} {incr d} { lappend names SLICE_X[expr {$x0-$d}]Y$y SLICE_X[expr {$x1+$d}]Y$y }
+    }
+    for {set x [expr {$x0-$band}]} {$x <= $x1+$band} {incr x} {
+        for {set d 1} {$d <= $band} {incr d} { lappend names SLICE_X${x}Y[expr {$y0-$d}] SLICE_X${x}Y[expr {$y1+$d}] }
+    }
+    set sites [get_sites -quiet [lsort -unique $names]]
+    set nload 0; set nblocked 0; set hold {}; set ints {}
+    foreach c [get_cells -quiet -of_objects $sites -filter "IS_PRIMITIVE && NAME =~ WRAPPER/CL/* && NAME !~ $rp/*"] {
+        foreach p [get_pins -quiet -of_objects $c -filter {DIRECTION == IN}] {
+            if {[get_property -quiet TYPE [get_nets -quiet -of_objects $p]] ne "GROUND"} continue
+            foreach sp [get_site_pins -quiet -of_objects $p] {
+                incr nload
+                set node [get_nodes -quiet -of_objects $sp]
+                set d1 [get_nodes -quiet -uphill -of_objects $node]
+                set open 0; set occ {}
+                foreach u $d1 {
+                    if {[string match */VCC_WIRE [get_property NAME $u]]} continue
+                    set un [get_nets -quiet -of_objects $u]
+                    if {[llength $un]} { lappend occ [get_property NAME $u]; continue }
+                    foreach u2 [get_nodes -quiet -uphill -of_objects $u] {
+                        if {[llength [get_nets -quiet -of_objects $u2]]} continue
+                        set out 1
+                        foreach t [get_tiles -quiet -of_objects $u2 -filter {TYPE =~ INT*}] { if {[pr_in_box [get_property NAME $t] $box]} { set out 0 } }
+                        if {$out} { set open 1; break }
+                    }
+                    if {$open} break
+                }
+                if {$open} continue
+                incr nblocked
+                lappend hold {*}$occ
+                foreach t [get_tiles -quiet -of_objects $node -filter {TYPE =~ INT*}] { lappend ints [get_property NAME $t] }
+                puts "PR: rp-edge GND load blocked: [get_property NAME $p] at [get_property NAME $sp] (first-hop nodes held [llength $occ])"
+            }
+        }
+    }
+    set unets {}
+    if {[llength $hold]} { set unets [pr_releasable [get_nets -quiet -of_objects [get_nodes -quiet [lsort -unique $hold]]] $rp $box 0] }
+    set fnames {}
+    foreach it [lsort -unique $ints] {
+        if {![regexp {INT_X(\d+)Y(\d+)} $it -> tx ty]} continue
+        for {set i -$fx} {$i <= $fx} {incr i} { for {set j -$fy} {$j <= $fy} {incr j} {
+            set nm INT_X[expr {$tx+$i}]Y[expr {$ty+$j}]
+            if {![pr_in_box $nm $box]} { lappend fnames $nm }
+        } }
+    }
+    set fnets {}
+    if {[llength $fnames]} { set fnets [pr_releasable [get_nets -quiet -of_objects [get_nodes -quiet -of_objects [get_tiles -quiet [lsort -unique $fnames]]]] $rp $box] }
+    set f 0
+    foreach grp [list $fnets $unets] {
+        if {![llength $grp]} continue
+        set fx_ [filter -quiet $grp {IS_ROUTE_FIXED}]
+        if {[llength $fx_]} { set_property IS_ROUTE_FIXED 0 $fx_; incr f [llength $fx_] }
+    }
+    if {[llength $unets]} { route_design -unroute -nets $unets }
+    puts "PR: rp-edge GND release: RP slices X$x0..$x1 Y$y0..$y1 INT box $box band=$band edge sites=[llength $sites] static GND loads=$nload blocked=$nblocked unrouted=[llength $unets] unfixed=$f ([expr {[clock seconds]-$t0}]s)"
+    return [llength $unets]
+}
+
 # ---- step 3: route the RP and its boundary only -----------------------------
 # Call after place_design. No phys_opt_design: it restructures static cells.
 proc pr_route_rp {rp pblock} {
@@ -254,6 +367,7 @@ proc pr_route_rp {rp pblock} {
                 -filter "ROUTE_STATUS == ROUTED && IS_ROUTE_FIXED == 0 && NAME !~ $rp/*"]
     if {[llength $st]} { set_property IS_ROUTE_FIXED 1 $st }
     puts "PR: fixed [llength $st] routed static nets; unrouted static signal nets=[llength $xun]"
+    pr_release_rp_edge_gnd $rp $pblock
     pr_const_rp_repair $rp $pblock pre_route
     if {[catch {route_design} e]} {
         puts "PR: route_design failed, retrying once after releasing unfixed conflicts: [string range $e 0 400]"
