@@ -35,7 +35,7 @@ proc rw_write_ooc_context {xdc ctx {budget 0.4}} {
   puts "RWFLOW ctx: $n ports with PPLOC -> $ctx; xdc -> $xdc"
 }
 
-proc rw_impl_rm_ooc {rm xdc ctx out edf_dir} {
+proc rw_impl_rm_ooc {rm xdc ctx out edf_dir {do_route 1}} {
   rw_timed ooc_open [list open_checkpoint $rm]
   # The in-context RP is HD.RECONFIGURABLE; read_checkpoint -cell refuses an HD.PARTITION OOC module (Project 1-1036).
   if {[catch {set_property HD.RECONFIGURABLE 1 [current_design]} e]} {
@@ -61,7 +61,11 @@ proc rw_impl_rm_ooc {rm xdc ctx out edf_dir} {
   }
   close $fh
   puts "RWFLOW ooc partpin locs: node=$node_ok tile=$tile_ok unused_port=$unused fail=$fail"
-  foreach {k cmd} {ooc_opt opt_design ooc_place place_design ooc_phys phys_opt_design ooc_route route_design} {
+  set steps {ooc_opt opt_design ooc_place place_design ooc_phys phys_opt_design}
+  # do_route 0: placement only; the in-context route_design then routes the RM against the real static
+  # (an OOC-routed RM collided with static routing crossing the RP region: 116 conflicts, rw_c_viv4).
+  if {$do_route} { lappend steps ooc_route route_design }
+  foreach {k cmd} $steps {
     if {[rw_timed $k $cmd]} { error "RWFLOW OOC $k failed" }
   }
   puts [report_route_status -return_string]

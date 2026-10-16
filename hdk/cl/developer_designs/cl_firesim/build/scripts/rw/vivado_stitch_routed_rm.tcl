@@ -6,28 +6,41 @@
 # branches to their RM pins, so the static side (ending at the base PPLOC / static clock tree) stays.
 # (rw_c_viv3: unrouting all 10658 RM-side boundary pins incl. clock/reset ran single-threaded >10 min.)
 proc rw_unroute_rm_side {} {
+  # GND/VCC are skipped: in rw_c_viv4 the design GND reported CONFLICTS through ~1900 hierarchical
+  # <const0> aliases, and per-alias leaf-pin queries on it are very slow. Unrouting the conflicting RM
+  # signal nets frees the shared nodes; constant nets keep their (locked) static routing.
   set badn [get_nets -quiet -hierarchical -top_net_of_hierarchical_group \
-              -filter {ROUTE_STATUS == CONFLICTS || ROUTE_STATUS == PARTIAL || ROUTE_STATUS == UNROUTED}]
-  set rmint {}; set bnd {}
+              -filter {(ROUTE_STATUS == CONFLICTS || ROUTE_STATUS == PARTIAL || ROUTE_STATUS == UNROUTED) && TYPE != GROUND && TYPE != POWER}]
+  set badn [get_nets -quiet -segments -top_net_of_hierarchical_group $badn]
+  # Static-only nets (no RP pin) are never unfixed: in rw_c_viv4 unfixing conflicting static nets let the
+  # router re-route static branches through the RP without PartPins (Constraints 18-4430).
+  set rmint {}; set bnd {}; set stat 0
   foreach n $badn {
     set lp [get_pins -quiet -leaf -of_objects $n]
     set out [filter -quiet $lp "NAME !~ $::RP/*"]
-    if {[llength $out]} { lappend bnd $n } else { lappend rmint $n }
+    set in [filter -quiet $lp "NAME =~ $::RP/*"]
+    if {![llength $in]} { incr stat } elseif {[llength $out]} { lappend bnd $n } else { lappend rmint $n }
   }
-  puts "RWFLOW repair: nets not ROUTED=[llength $badn] RM-internal=[llength $rmint] boundary/static=[llength $bnd]"
-  foreach n [lrange $bnd 0 20] { puts "RWFLOW repair boundary/static net: $n [get_property ROUTE_STATUS $n] fixed=[get_property IS_ROUTE_FIXED $n]" }
+  puts "RWFLOW repair: nets not ROUTED=[llength $badn] RM-internal=[llength $rmint] boundary=[llength $bnd] static-only(kept)=$stat"
+  foreach n [lrange $bnd 0 20] { puts "RWFLOW repair boundary net: $n [get_property ROUTE_STATUS $n] fixed=[get_property IS_ROUTE_FIXED $n]" }
   if {[llength $rmint]} {
     set f [filter -quiet [get_nets $rmint] {IS_ROUTE_FIXED}]
     if {[llength $f]} { set_property IS_ROUTE_FIXED 0 $f }
     rw_timed unroute_rm_internal [list route_design -unroute -nets [get_nets $rmint]]
   }
+  # Boundary nets: unfix so the router may complete them. Pin-level unroute only for low-fanout ones:
+  # route_design -unroute -pins is single-threaded and slow (10658 pins: >22 min, killed, rw_c_viv3).
+  set pins {}
+  foreach n $bnd {
+    set rp [get_pins -quiet -leaf -of_objects [get_nets $n] -filter "NAME =~ $::RP/*"]
+    if {[llength $rp] <= 64} { lappend pins {*}$rp }
+  }
   if {[llength $bnd]} {
     set bn [get_nets $bnd]
-    set pins [get_pins -quiet -leaf -of_objects $bn -filter "NAME =~ $::RP/*"]
     set f [filter -quiet $bn {IS_ROUTE_FIXED}]
     if {[llength $f]} { set_property IS_ROUTE_FIXED 0 $f }
-    puts "RWFLOW repair: unrouting [llength $pins] RM-side pins of [llength $bn] boundary nets"
-    if {[llength $pins]} { rw_timed unroute_rm_pins [list route_design -unroute -pins $pins] }
+    puts "RWFLOW repair: unfixed [llength $f] boundary nets; unrouting [llength $pins] RM-side pins of low-fanout ones"
+    if {[llength $pins]} { rw_timed unroute_rm_pins [list route_design -unroute -pins [get_pins $pins]] }
   }
   return 0
 }

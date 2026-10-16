@@ -9,12 +9,18 @@
 #      (keeps the RM placement/routing), route_design only if the import left unrouted/errored nets
 #   4. canonical gates + fused AWS export (pr_recombine, partpin-prop clear) + pr_verify vs the AWS shell
 #
+# STATUS (2026-10-16): steps 3/4 PASS with an RM implemented in context against the same base (rw_b1:
+# 21.1 min, no route_design, pr_verify compatible). With an OOC-ROUTED RM (--ooc_route 1) they FAIL
+# (rw_c_viv4): 116 nets conflict with static routing that crosses the RP region (incl. GND), OOC
+# partition pins are tile-level only (nodes differ), and the repair route broke DFX rules
+# (Constraints 18-4430) after 22 min. --ooc_route 0 (OOC place only, in-context route) is UNTESTED.
+#
 # RapidWright was evaluated for steps 3/4 and is not usable here: the base's netlist cannot be exported
 # readable (write_edif: EDIF 20-92 on the AWS-protected top, Designutils 20-2284 IEEE-1735 IP in WRAPPER/CL).
 #
 #   vivado -mode batch -source main_pr_rm_preimpl.tcl -tclargs \
 #     --cl_dir <dir> --build_tag <tag> --base_dcp <nested base post_route.dcp> --rm_dcp <RM rm_post_synth.dcp> \
-#     [--cl_name <name>] [--ctx_dir <dir>] [--skip_route_if_routed 1]
+#     [--cl_name <name>] [--ctx_dir <dir>] [--skip_route_if_routed 1] [--ooc_route 0]
 # =============================================================================
 set script_start_time [clock seconds]
 set rw_dir [file dirname [file normalize [info script]]]
@@ -23,7 +29,7 @@ source $rw_dir/rw_common.tcl
 source $rw_dir/rw_rm_ooc.tcl
 source $rw_dir/vivado_stitch_routed_rm.tcl
 
-set opts [pr_parse_args $argv {cl_dir build_tag base_dcp rm_dcp} {cl_name ctx_dir skip_route_if_routed}]
+set opts [pr_parse_args $argv {cl_dir build_tag base_dcp rm_dcp} {cl_name ctx_dir skip_route_if_routed ooc_route}]
 set CL_DIR   [dict get $opts cl_dir]
 set TAG      [dict get $opts build_tag]
 set ::BASE   [dict get $opts base_dcp]
@@ -54,7 +60,7 @@ set fh [open $ctx_dir/rp_path.txt r]; set ::RP [string trim [read $fh]]; close $
 
 # 2. OOC implementation of the RM
 set ::RMDCP ${checkpoints_dir}/${CL}.${TAG}.rm_ooc_routed.dcp
-rw_impl_rm_ooc $rm_dcp $xdc $ctx $::RMDCP ""
+rw_impl_rm_ooc $rm_dcp $xdc $ctx $::RMDCP "" [pr_opt $opts ooc_route 0]
 close_design
 
 # 3+4. stitch, gates, nested child + fused AWS export + pr_verify
