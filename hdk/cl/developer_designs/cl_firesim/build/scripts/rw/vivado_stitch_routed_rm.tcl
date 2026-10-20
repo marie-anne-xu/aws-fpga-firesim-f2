@@ -45,6 +45,33 @@ proc rw_unroute_rm_side {} {
   return 0
 }
 
+# RapidWright routes non-timing-driven, so an imported RM can miss hold by a few ps (rwf_5 r3b: WHS=-0.045, while a
+# full route_design repair costs ~12 min, ~4 min of it router init). Targeted: unroute the RP-internal nets on the
+# hold-violating paths and route only them (route_design -nets ... -delay), static stays locked.
+proc rw_hold_fix_targeted {} {
+  set paths [get_timing_paths -quiet -hold -max_paths 500 -nworst 1 -slack_lesser_than 0]
+  puts "RWFLOW holdfix: [llength $paths] hold-violating paths"
+  foreach p [lrange $paths 0 9] {
+    puts "RWFLOW holdfix path slack=[get_property SLACK $p] [get_property STARTPOINT_PIN $p] -> [get_property ENDPOINT_PIN $p]"
+  }
+  if {![llength $paths]} { return 0 }
+  set nets [lsort -unique [get_nets -quiet -segments -top_net_of_hierarchical_group -of_objects $paths]]
+  set rm {}
+  foreach n $nets {
+    if {[get_property TYPE $n] ne "SIGNAL" && [get_property TYPE $n] ne ""} continue
+    set lp [get_pins -quiet -leaf -of_objects $n]
+    if {[llength $lp] && ![llength [filter -quiet $lp "NAME !~ $::RP/*"]]} { lappend rm $n }
+  }
+  puts "RWFLOW holdfix: [llength $nets] nets on the paths, [llength $rm] RP-internal: [lrange $rm 0 9]"
+  if {![llength $rm]} { return 1 }
+  set rmn [get_nets $rm]
+  set f [filter -quiet $rmn {IS_ROUTE_FIXED}]
+  if {[llength $f]} { set_property IS_ROUTE_FIXED 0 $f }
+  rw_timed holdfix_unroute [list route_design -unroute -nets $rmn]
+  rw_timed holdfix_route [list route_design -nets $rmn -delay]
+  return 0
+}
+
 proc rw_vivado_stitch {} {
   set t0 [clock seconds]
   rw_timed open_base [list open_checkpoint $::BASE]
@@ -78,6 +105,13 @@ proc rw_vivado_stitch {} {
     rw_timed route [list route_design -directive Default]
   }
   set bad [rw_gates $::TAG [file dirname $::OUT]]
+  if {$bad && [info exists ::HOLD_FIX_TARGETED] && $::HOLD_FIX_TARGETED} {
+    set whs [get_property SLACK [get_timing_paths -max_paths 1 -nworst 1 -hold]]
+    if {$whs ne "" && $whs < 0} {
+      rw_hold_fix_targeted
+      set bad [rw_gates ${::TAG}_holdfix [file dirname $::OUT]]
+    }
+  }
   if {$bad && (![info exists ::REPAIR_ROUTE] || $::REPAIR_ROUTE)} {
     # Repair: drop the RM side of every boundary net (signal + clock) and route again; static stays locked.
     rw_unroute_rm_side

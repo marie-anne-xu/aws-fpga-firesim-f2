@@ -45,6 +45,22 @@ proc rw_impl_rm_ooc {rm xdc ctx out edf_dir {do_route 1}} {
   puts "RWFLOW ooc top HD.RECONFIGURABLE=[get_property -quiet HD.RECONFIGURABLE [current_design]] HD.PARTITION=[get_property -quiet HD.PARTITION [current_design]]"
   # OOC-only: clock, HD.CLK_SRC, pblock and I/O budgets must not travel into the base (in-context RP has its own).
   read_xdc -mode out_of_context $xdc
+  # In context Vivado gives every RP input without loads a DFX buffer (HD_PR_Connection_S_IN_BUF_*) so the static
+  # route into its PPLOC terminates; OOC synth/opt leaves such ports net-less, and after pr_recombine the static
+  # stubs become antennas (rwf_4 r3a: 6 io_snoop_bits_address[5:0] nets). Give each one a DONT_TOUCH LUT1 load.
+  set nload 0
+  foreach p [get_ports -quiet -filter {DIRECTION == IN && NAME != clock}] {
+    set n [get_nets -quiet -of_objects $p]
+    if {[llength $n] && [llength [get_pins -quiet -leaf -of_objects $n -filter {DIRECTION == IN}]]} continue
+    set c rwf_in_load_$nload
+    create_cell -reference LUT1 $c
+    set_property INIT 2'h2 [get_cells $c]
+    set_property DONT_TOUCH 1 [get_cells $c]
+    if {![llength $n]} { set n [create_net rwf_in_net_$nload]; connect_net -net $n -objects [list $p] }
+    connect_net -net $n -objects [list [get_pins $c/I0]]
+    incr nload
+  }
+  puts "RWFLOW ooc load-less input ports given a LUT1 load: $nload"
   # partition pins: try the exact base PPLOC node, fall back to its INT tile
   set node_ok 0; set tile_ok 0; set fail 0; set unused 0
   set fh [open $ctx r]
