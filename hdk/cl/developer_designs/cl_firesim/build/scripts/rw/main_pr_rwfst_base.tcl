@@ -1,39 +1,63 @@
-# =============================================================================
-# ONCE PER BASE -- inputs for the firesim_top-level RapidWright child flow (main_pr_rm_rwfst.tcl).
-# AWS F2 nested DFX, non-project mode. Writes into --out_dir:
-#   base_pplocs.txt          RP pin -> base PPLOC node(s)
-#   rm_ooc.xdc rm_ctx.txt    OOC context for the RM place step (pblock, clock, HD.CLK_SRC, PPLOC tile per port)
-#   base_rp.dcp/.edf         the base's own RM cell (partition-pin template, incl. clock partpins)
-#   blockers.txt             P probe: nets using the RP region with no pin inside firesim_top
-#   fst_bb.dcp fst.edf       WRAPPER/CL/firesim_top cell DCP (RP black-boxed, static locked) + readable EDIF
-#   routes.txt               routing of every net using the RP clock regions (the cell DCP carries almost none)
-#
+# ONCE PER BASE: inputs of main_pr_rm.tcl --rw_base_dir (RapidWright child flow), from the nested base post_route.dcp.
 #   vivado -mode batch -source main_pr_rwfst_base.tcl -tclargs --base_dcp <nested base post_route.dcp> --out_dir <dir>
-# =============================================================================
-set t_start [clock seconds]
 set rw_dir [file dirname [file normalize [info script]]]
 source [file dirname $rw_dir]/pr_utils.tcl
-source $rw_dir/rw_common.tcl
-source $rw_dir/rw_rm_ooc.tcl
-source $rw_dir/rw_fst.tcl
-set opts [pr_parse_args $argv {base_dcp out_dir} {skip_probe}]
-set base [dict get $opts base_dcp]
-set out  [dict get $opts out_dir]
+set opts [pr_parse_args $argv {base_dcp out_dir} {}]
+set out [dict get $opts out_dir]
 file mkdir $out
-rw_timed base_open [list open_checkpoint $base]
-set rp [get_cells -quiet -hierarchical -filter {HD.RECONFIGURABLE == 1 && NAME =~ WRAPPER/CL/*}]
+open_checkpoint [dict get $opts base_dcp]
+set rp [get_cells -hierarchical -filter {HD.RECONFIGURABLE == 1 && NAME =~ WRAPPER/CL/*}]
 if {[llength $rp] != 1} { error "PR: expected one nested RP in the base, found: $rp" }
-set ::RP [get_property NAME $rp]
-set ::RPFST [string range $::RP [string length $::FST/] end]
-set fh [open $out/rp_path.txt w]; puts $fh $::RP; close $fh
-rw_dump_pplocs $out/base_pplocs.txt
-rw_write_ooc_context $out/rm_ooc.xdc $out/rm_ctx.txt
-set fh [open $out/rp_clock_regions.txt w]; puts $fh [rw_rp_clock_regions]; close $fh
-rw_timed base_rp_template [list write_checkpoint -force -cell $::RP $out/base_rp.dcp]
-rw_timed base_rp_template_edif [list rw_write_readable_edif $::RP $out/base_rp_edf base_rp]
-file copy -force $out/base_rp_edf/base_rp.edf $out/base_rp.edf
-if {![pr_opt $opts skip_probe 0]} { rw_timed P_probe [list rw_fst_probe $out/blockers.txt] }
-rw_timed fst_export [list rw_fst_export $out/fst_bb.dcp $out/fst_edf]
-file copy -force $out/fst_edf/fst.edf $out/fst.edf
-rw_timed dump_routes [list rw_fst_dump_routes $out/routes.txt]
-puts "PR: rwfst base prep done in [expr {[clock seconds] - $t_start}] s -> $out"
+set fh [open $out/rp_path.txt w]; puts $fh [get_property NAME $rp]; close $fh
+
+# RP clock regions
+set pb [get_pblocks -of $rp]
+set ranges [get_property GRID_RANGES $pb]
+set crs {}
+foreach r $ranges {
+  if {[regexp {CLOCKREGION_X(\d+)Y(\d+):CLOCKREGION_X(\d+)Y(\d+)} $r -> x0 y0 x1 y1]} {
+    for {set x $x0} {$x <= $x1} {incr x} { for {set y $y0} {$y <= $y1} {incr y} { lappend crs X${x}Y${y} } }
+  }
+}
+set crs [lsort -unique $crs]
+set fh [open $out/rp_clock_regions.txt w]; puts $fh $crs; close $fh
+
+# OOC context for the RM place step
+set ck [get_pins $rp/clock]
+set per [get_property PERIOD [lindex [get_clocks -of_objects $ck] 0]]
+set src [get_property LOC [get_cells -of_objects [get_pins -leaf -of_objects [get_nets -of $ck] -filter {DIRECTION == OUT}]]]
+set fh [open $out/rm_ooc.xdc w]
+puts $fh "create_clock -name rmclk -period $per \[get_ports clock\]
+set_property HD.CLK_SRC $src \[get_ports clock\]
+create_pblock pblock_rm
+resize_pblock pblock_rm -add {$ranges}
+add_cells_to_pblock pblock_rm -top
+set_property CONTAIN_ROUTING true \[get_pblocks pblock_rm\]
+set_property EXCLUDE_PLACEMENT true \[get_pblocks pblock_rm\]
+set_input_delay -clock rmclk [expr {$per * 0.4}] \[get_ports -filter {DIRECTION == IN && NAME != clock}\]
+set_output_delay -clock rmclk [expr {$per * 0.4}] \[get_ports -filter {DIRECTION == OUT}\]"
+close $fh
+set fh [open $out/rm_ctx.txt w]
+foreach p [get_pins -of $rp] {
+  set v [get_property -quiet HD.ASSIGNED_PPLOCS $p]
+  if {$v ne ""} { puts $fh "[get_property REF_PIN_NAME $p] [lindex [split [lindex $v 0] /] 0]" }
+}
+close $fh
+
+# Base RM cell: partition-pin template
+write_checkpoint -force -cell $rp $out/base_rp.dcp
+write_edif -force -cell $rp $out/base_rp.edf
+
+update_design -cell $rp -black_box
+lock_design -level routing
+write_checkpoint -force -cell WRAPPER/CL/firesim_top $out/fst_bb.dcp
+write_edif -force -cell WRAPPER/CL/firesim_top $out/fst.edf
+
+# write_checkpoint -cell drops firesim_top's routing: dump nets using the RP region
+set rt [filter [get_tiles -of_objects [get_clock_regions $crs]] {TYPE =~ INT* || TYPE =~ RCLK*}]
+set fh [open $out/routes.txt w]
+foreach n [get_nets -quiet -of_objects $rt] {
+  set ps [get_pips -quiet -of_objects $n]
+  if {[llength $ps]} { puts $fh "$n [join $ps { }]" }
+}
+close $fh

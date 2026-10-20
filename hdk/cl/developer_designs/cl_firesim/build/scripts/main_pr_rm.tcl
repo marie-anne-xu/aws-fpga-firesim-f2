@@ -12,8 +12,9 @@
 #
 #   vivado -mode batch -source main_pr_rm.tcl -tclargs \
 #     --cl_dir <dir> --build_tag <tag> --base_dcp <dcp> --rm_dcp <dcp> \
-#     [--cl_name <name>] [--pr_partition_path <hier/path>]
+#     [--cl_name <name>] [--pr_partition_path <hier/path>] [--rw_base_dir <dir>]
 #
+# --rw_base_dir (out dir of rw/main_pr_rwfst_base.tcl): OOC place + RapidWright route the RM first, skip in-place P&R.
 # --pr_partition_path overrides the path the base build recorded.
 # =============================================================================
 
@@ -29,7 +30,7 @@ proc pr_t {step script} {
 
 set opts [pr_parse_args $argv \
               {cl_dir build_tag base_dcp rm_dcp} \
-              {cl_name pr_partition_path}]
+              {cl_name pr_partition_path rw_base_dir}]
 
 set CL_DIR   [dict get $opts cl_dir]
 set TAG      [dict get $opts build_tag]
@@ -47,6 +48,11 @@ if {[file normalize $base_dcp] eq [file normalize $out_dcp]} {
 
 foreach f [list $base_dcp $rm_dcp] {
     if {![file exists $f]} { error "PR: checkpoint not found: $f" }
+}
+set rw_base_dir [pr_opt $opts rw_base_dir]
+if {$rw_base_dir ne ""} {
+    source ${scripts_dir}/rw/rw_common.tcl
+    set rm_dcp [rw_route_rm $rm_dcp $rw_base_dir ${checkpoints_dir}/${CL}.${TAG}]
 }
 
 # Explicit path wins; otherwise use what the base build recorded.
@@ -107,11 +113,15 @@ pr_t read_rm {read_checkpoint -cell $pr_partition_path $rm_dcp}
 # Implement only the RM; the static is locked.
 # Directives per trial bf7: Quick place/route, no phys_opt -> 58.8 min swap vs 82.6 default, timing met
 # (static-dominated WNS .120 / WHS .010), pr_verify compatible.
+if {$rw_base_dir ne "" && [rw_rm_routed]} {
+    puts "PR: RapidWright-routed RM imported fully routed; skipping opt/place/route"
+} else {
 pr_t opt {opt_design}
 pr_t place {place_design -directive Quick}
 # Quick route skips hold fixing: bfc2 (AMPM RM) shipped WHS=-0.050 (40 RM endpoints).
 # Default route closes hold; directive pending trial bf10_child_ampm_hold.
 pr_t route {route_design -directive Default}
+}
 
 # Last chance to catch a bad stitch before a multi-hour AFI bake.
 pr_check_routed "RM implementation"
