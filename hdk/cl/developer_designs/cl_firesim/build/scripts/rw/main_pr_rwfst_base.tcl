@@ -36,6 +36,9 @@ set_property CONTAIN_ROUTING true \[get_pblocks pblock_rm\]
 set_property EXCLUDE_PLACEMENT true \[get_pblocks pblock_rm\]
 set_input_delay -clock rmclk [expr {$per * 0.4}] \[get_ports -filter {DIRECTION == IN && NAME != clock}\]
 set_output_delay -clock rmclk [expr {$per * 0.4}] \[get_ports -filter {DIRECTION == OUT}\]"
+# Sites the RP prohibits (FSR edge tiles) are legal OOC; prohibit them for the RM place too.
+set ps [get_sites -quiet -filter PROHIBIT -of_objects [get_clock_regions $crs]]
+if {[llength $ps]} { puts $fh "set_property PROHIBIT true \[get_sites {$ps}\]" }
 close $fh
 set fh [open $out/rm_ctx.txt w]
 foreach p [get_pins -of $rp] {

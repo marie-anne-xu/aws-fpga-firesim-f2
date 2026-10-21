@@ -66,5 +66,6 @@ proc rw_rm_routed {} {
   set e 1; set u 0
   regexp {# of nets with routing errors\.*\s*:\s*(\d+)} $st -> e
   regexp {# of unrouted nets\.*\s*:\s*(\d+)} $st -> u
+  puts "PR: RapidWright RM import: $e net(s) with routing errors, $u unrouted"
   return [expr {$e == 0 && $u == 0}]
 }
