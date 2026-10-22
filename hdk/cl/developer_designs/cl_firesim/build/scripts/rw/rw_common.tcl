@@ -58,7 +58,7 @@ proc rw_route_rm {rm b prefix} {
   return $out
 }
 
-# After read_checkpoint -cell: drop the RM's OOC pblock; 1 if fully routed.
+# After read_checkpoint -cell: drop the RM's OOC pblock; 1 if fully routed with timing met.
 proc rw_rm_routed {} {
   set extra [get_pblocks -quiet -filter {NAME !~ pblock_CL* && NAME !~ pblock_pr_region*}]
   if {[llength $extra]} { delete_pblocks $extra }
@@ -66,6 +66,8 @@ proc rw_rm_routed {} {
   set e 1; set u 0
   regexp {# of nets with routing errors\.*\s*:\s*(\d+)} $st -> e
   regexp {# of unrouted nets\.*\s*:\s*(\d+)} $st -> u
-  puts "PR: RapidWright RM import: $e net(s) with routing errors, $u unrouted"
-  return [expr {$e == 0 && $u == 0}]
+  set wns [get_property SLACK [get_timing_paths -max_paths 1 -nworst 1 -setup]]
+  set whs [get_property SLACK [get_timing_paths -max_paths 1 -nworst 1 -hold]]
+  puts "PR: RapidWright RM import: $e net(s) with routing errors, $u unrouted, WNS=$wns WHS=$whs"
+  return [expr {$e == 0 && $u == 0 && $wns >= 0 && $whs >= 0}]
 }

@@ -14,7 +14,8 @@
 #     --cl_dir <dir> --build_tag <tag> --base_dcp <dcp> --rm_dcp <dcp> \
 #     [--cl_name <name>] [--pr_partition_path <hier/path>] [--rw_base_dir <dir>]
 #
-# --rw_base_dir (out dir of rw/main_pr_rwfst_base.tcl): OOC place + RapidWright route the RM first, skip in-place P&R.
+# --rw_base_dir (out dir of rw/main_pr_rwfst_base.tcl): OOC place + RapidWright route the RM first, skip in-place P&R;
+# if RapidWright fails or its RM is not routed clean with timing met, the normal in-place P&R flow runs instead.
 # --pr_partition_path overrides the path the base build recorded.
 # =============================================================================
 
@@ -50,9 +51,16 @@ foreach f [list $base_dcp $rm_dcp] {
     if {![file exists $f]} { error "PR: checkpoint not found: $f" }
 }
 set rw_base_dir [pr_opt $opts rw_base_dir]
+set rm_synth_dcp $rm_dcp
 if {$rw_base_dir ne ""} {
     source ${scripts_dir}/rw/rw_common.tcl
-    set rm_dcp [rw_route_rm $rm_dcp $rw_base_dir ${checkpoints_dir}/${CL}.${TAG}]
+    if {[catch {rw_route_rm $rm_dcp $rw_base_dir ${checkpoints_dir}/${CL}.${TAG}} rw_dcp]} {
+        puts "PR: RapidWright failed ($rw_dcp); using the normal pr flow"
+        while {[llength [get_designs -quiet]]} { close_design }
+        set rw_base_dir ""
+    } else {
+        set rm_dcp $rw_dcp
+    }
 }
 
 # Explicit path wins; otherwise use what the base build recorded.
@@ -113,7 +121,13 @@ pr_t read_rm {read_checkpoint -cell $pr_partition_path $rm_dcp}
 # Implement only the RM; the static is locked.
 # Directives per trial bf7: Quick place/route, no phys_opt -> 58.8 min swap vs 82.6 default, timing met
 # (static-dominated WNS .120 / WHS .010), pr_verify compatible.
-if {$rw_base_dir ne "" && [rw_rm_routed]} {
+if {$rw_base_dir ne "" && ![rw_rm_routed]} {
+    puts "PR: RapidWright RM not routed clean with timing met; using the normal pr flow"
+    pr_t black_box_rw {update_design -cell $pr_partition_path -black_box}
+    pr_t read_rm_synth {read_checkpoint -cell $pr_partition_path $rm_synth_dcp}
+    set rw_base_dir ""
+}
+if {$rw_base_dir ne ""} {
     puts "PR: RapidWright-routed RM imported fully routed; skipping opt/place/route"
 } else {
 pr_t opt {opt_design}
