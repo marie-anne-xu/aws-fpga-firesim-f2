@@ -1,22 +1,8 @@
-# =============================================================================
-# Nested-DFX pass-2 implementation helpers (AWS F2), used by main_pr_subdivide.tcl.
-#
-# Ported from trial g9_cell_const_unroute (placed + routed, WNS +0.060 ns,
-# WHS +0.010 ns, 124/124 DDR bitslices fixed, DFX DRC 0 errors, no ERROR lines):
-#   1. Export the placed+routed WRAPPER/CL of the pass-1 parent as a cell
-#      checkpoint, strip its pblocks, and unroute its GND/VCC nets
-#      (pr_write_clean_cl_cell). Static constants routed through the future
-#      RP region otherwise cause HPR routing violations (Constraints 18-5228).
-#   2. Open the AWS shell, lock_design -level routing, then pr_subdivide from
-#      that placed cell. SH_DDR arrives placed and generated (no MIG regen).
-#   3. Freeze all static logic (LUT pin maps, placement, routes) and place and
-#      route only the RP plus its boundary nets (pr_route_rp). Rerouting
-#      static nets produced DFX route DRC 18-1000 in earlier trials.
-# Procs take the RP path explicitly. RP paths must not contain glob characters.
-# =============================================================================
+# Base pass 2 helpers (main_pr_subdivide.tcl): subdivide from the placed pass-1 CL, freeze all
+# static logic, and place/route only the RP and its boundary. RP paths must not contain globs.
 
-# ---- step 1: clean CL cell checkpoint ---------------------------------------
-# Call with the routed pass-1 parent open. Closes it and leaves no design open.
+# Pass-1 CL cell without pblocks and with GND/VCC unrouted (static constants through the
+# RP region are illegal, 18-5228). Call with the routed pass 1 open; closes it.
 proc pr_write_clean_cl_cell {cell_dcp clean_dcp} {
     write_checkpoint -force -cell WRAPPER/CL $cell_dcp
     close_design
@@ -36,7 +22,6 @@ proc pr_write_clean_cl_cell {cell_dcp clean_dcp} {
     close_design
 }
 
-# ---- step 3 helpers: floorplan and static locks -----------------------------
 proc pr_make_rp_pblock {rp region} {
     foreach rng $region {
         foreach grp {pblock_CL_SLR0 pblock_CL_SLR1 pblock_CL_SLR2} {
@@ -69,9 +54,7 @@ proc pr_lut_lock_str {c} {
     return [join $m " "]
 }
 
-# Lock the pin mapping of placed LUTs not locked yet. Without this the router
-# swaps LUT pins on static boundary loads whose other inputs have fixed routes,
-# which fails DFX route DRC (Constraints 18-1000).
+# Lock LUT pin maps: router pin swaps on static loads with fixed routes fail DFX DRC (18-1000).
 proc pr_lock_lut_pins {cells label} {
     set t0 [clock seconds]
     set n 0; set pre 0; set skip 0; set fail 0; set i 0
@@ -80,8 +63,7 @@ proc pr_lock_lut_pins {cells label} {
         if {[get_property LOCK_PINS $c] ne ""} { incr pre; continue }
         set ls [pr_lut_lock_str $c]
         if {$ls eq ""} { incr skip; continue }
-        # Tolerated as in the validated trial: the router then keeps this LUT's
-        # inputs on whatever pins its fixed static routes already use.
+        # Tolerated: the router keeps these inputs on the pins their fixed routes use.
         if {[catch {set_property LOCK_PINS $ls $c}]} { incr fail; continue }
         incr n
     }
@@ -114,8 +96,7 @@ proc pr_unplace_partial_macros {rp} {
     puts "PR: unplaced static primitives=[llength $unpl], partially placed macros reset=$n"
 }
 
-# Lock placement of every static sibling along the RP's ancestor chain (this
-# covers all of WRAPPER/CL except the RP).
+# Lock placement of all of WRAPPER/CL except the RP.
 proc pr_lock_static_except_rp {rp} {
     set chain {}
     set p $rp
@@ -141,7 +122,6 @@ proc pr_lock_static_except_rp {rp} {
     puts "PR: static placement locked: hierarchies=$nh leaves=$nl"
 }
 
-# ---- partition-pin ranges ---------------------------------------------------
 proc pr_tile_xy {cell} {
     set loc [get_property -quiet LOC $cell]
     if {$loc eq ""} { return "" }
@@ -158,10 +138,8 @@ proc pr_static_ends {rp p} {
     }
     return $st
 }
-# For every io_request_bits_address output with static loads outside the RP rows,
-# constrain its PartPin to the band of RP slice rows nearest those loads (rows
-# 1..6 inside the edge, X within +/-6 INT columns). Without it the router could
-# not assign PartPins for address bits whose loads sit far above the region.
+# Put each io_request_bits_address PartPin near its static loads (rows 1..6 inside the RP edge);
+# otherwise PartPins can't be assigned for loads far outside the region (18-4636).
 proc pr_set_partpin_ranges {rp pblock} {
     set recs {}
     set ymin 1e9; set ymax -1
@@ -200,10 +178,7 @@ proc pr_set_partpin_ranges {rp pblock} {
     puts "PR: HD.PARTPIN_RANGE set on $n RP address pins (pblock INT rows $ymin..$ymax)"
 }
 
-# ---- static constants inside the RP region ----------------------------------
-# Static GND/VCC routes must not cross the RP region (18-5228). The clean CL
-# cell import already guarantees this; scan anyway, and unroute any offender
-# so the router re-routes it outside the region.
+# Unroute any static GND/VCC route that crosses the RP region (18-5228).
 proc pr_const_nets_in_rp {pblock} {
     set xs {}; set ys {}
     foreach t [get_tiles -quiet -of_objects [get_sites -quiet -of_objects [get_pblocks $pblock]]] {
@@ -227,19 +202,8 @@ proc pr_const_rp_repair {rp pblock label} {
     puts "PR: $label unrouted [llength $bad] static constant nets for re-route outside the RP"
 }
 
-# ---- static GND loads on the RP boundary ------------------------------------
-# A static load tied to GND right outside the RP (e.g. an unused LUTRAM DI in the
-# first static column) may have taken its pass-1 GND tie-off from an unused LUT
-# inside the then-empty reserved region. After pr_subdivide static routing may not
-# enter the RP, and with every static route fixed all static-side entries to that
-# pin can be taken (Route 35-534/35-7 "GNDNet ... unroutable pin"; SLR2 region
-# X1Y8:X2Y8, SLICE_X95Y529/H_I). For each such load whose site pin has no free
-# static-side path two hops up, unroute only the static nets holding its first-hop
-# nodes and unfix the static nets on nearby static INT tiles. Nets that touch any
-# RP-region INT tile are not unfixed in the wider window (a +/-6 window that reached
-# into the RP left ~9.5k overlaps in rgfix_window); the few first-hop holders are
-# unrouted even if their fixed pass-1 route enters the RP box (rgfix_edge2: all 5
-# holders at SLICE_X95Y529 arrive via INT_X59, so excluding them released nothing).
+# A static GND load just outside the RP may have tied off through the then-empty region in
+# pass 1 and become unroutable (Route 35-534): free the static routes blocking its pin.
 proc pr_rp_int_box {pblock} {
     set xs {}; set ys {}
     foreach t [get_tiles -quiet -of_objects [get_sites -quiet -of_objects [get_pblocks $pblock]]] {
@@ -340,8 +304,7 @@ proc pr_release_rp_edge_gnd {rp pblock {band 2} {fx 2} {fy 4}} {
     return [llength $unets]
 }
 
-# ---- step 3: route the RP and its boundary only -----------------------------
-# Call after place_design. No phys_opt_design: it restructures static cells.
+# Route only the RP and its boundary (after place_design; no phys_opt, it changes static cells).
 proc pr_route_rp {rp pblock} {
     set bnets [get_nets -quiet -of_objects [get_pins -quiet $rp/*]]
     set bsig [filter -quiet $bnets {TYPE != GLOBAL_CLOCK}]
