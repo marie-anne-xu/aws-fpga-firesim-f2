@@ -1,12 +1,5 @@
-# Native DDR PHY handling for the nested parent (pass 2).
-#
-# The AWS DDR4 PHY (WRAPPER/CL/SH_DDR) is inside the partition being subdivided.
-# Reloading it from the post-synth netlist unplaces its native-mode bitslices
-# (Place 30-687/30-686), and regenerating the MIG (opt_design or
-# implement_xphy_cores) discards any LOC restore. main_pr_subdivide.tcl
-# therefore runs pr_subdivide from the *placed* pass-1 CL cell checkpoint, so
-# SH_DDR arrives already placed and generated. The procs below only freeze that
-# placement and check it. Never run opt_design on the subdivided design.
+# The DDR4 PHY (SH_DDR) is inside the subdivided partition and can't be re-placed (Place 30-687),
+# so pass 2 imports it placed from pass 1; these procs freeze and check it. No opt_design after.
 
 # Freeze SH_DDR exactly as imported. It must not be optimized, moved, or replaced.
 proc pr_lock_ddr_placement {} {

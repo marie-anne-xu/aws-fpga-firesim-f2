@@ -58,52 +58,24 @@ puts "AWS FPGA: ([clock format [clock seconds] -format %T]) Reading developer's 
 # .vh, nor .inc files
 # read_verilog -sv [glob ${src_post_enc_dir}/*.{s,}v]
 source ${CL_DIR}/build/scripts/pr_utils.tcl
-
+read_verilog -sv [glob ${CL_DIR}/design/*.{s,}v]
 if {[pr_enabled]} {
-    # DFX: the RM must be ABSENT so it elaborates as a black box (synthesized
-    # separately by synth_cl_firesim_rm.tcl). Drop the monolithic
-    # FireSim-generated.sv, which contains it, in favour of split-verilog;
-    # keeping both would duplicate modules and re-introduce the RM.
+    # Synthesize the base RM in place so synth loads calibration_ddr.elf into the DDR
+    # calibration BRAMs (it skips this with a black box); the RM is black-boxed afterwards.
     set pr_module_names [pr_split [pr_env FIRESIM_PR_MODULE_NAME]]
     if {[llength $pr_module_names] == 0} {
         error "PR: FIRESIM_PR_MODULE_NAME must name the reconfigurable module"
     }
-    set split_dir ${CL_DIR}/design/split-verilog
-    if {![file isdirectory $split_dir]} {
-        error "PR: split-verilog directory not found: $split_dir\
-               (run 'make replace-rtl' to populate it)"
+    file mkdir ${CL_DIR}/build/pr_stubs
+    set keep_xdc ${CL_DIR}/build/pr_stubs/rm_keep_hierarchy.xdc
+    set fh [open $keep_xdc w]
+    foreach mod $pr_module_names {
+        puts $fh "set_property KEEP_HIERARCHY TRUE \[get_cells -hierarchical -filter {REF_NAME == $mod}\]"
+        puts $fh "set_property DONT_TOUCH TRUE \[get_cells -hierarchical -filter {REF_NAME == $mod}\]"
     }
-
-    set cl_srcs {}
-    foreach f [glob -nocomplain ${CL_DIR}/design/*.{s,}v] {
-        if {[file tail $f] eq "FireSim-generated.sv"} { continue }
-        lappend cl_srcs $f
-    }
-    # Withhold each RM's RTL and substitute an empty stub. Vivado errors on a
-    # missing module rather than inferring a black box, so the stub supplies the
-    # port list while leaving the cell empty for DFX.
-    set stub_dir ${CL_DIR}/build/pr_stubs
-    file mkdir $stub_dir
-    set excluded 0
-    foreach f [glob -nocomplain -directory $split_dir *.sv] {
-        set mod [file rootname [file tail $f]]
-        if {$mod in $pr_module_names} {
-            puts "PR: withholding [file tail $f] from static synthesis (black box)"
-            lappend cl_srcs [pr_write_stub $f $mod ${stub_dir}/${mod}_stub.v]
-            incr excluded
-            continue
-        }
-        lappend cl_srcs $f
-    }
-    if {$excluded != [llength $pr_module_names]} {
-        error "PR: expected to withhold [llength $pr_module_names] module file(s)\
-               but found $excluded in $split_dir -- check the generated module name."
-    }
-
-    puts "PR: reading [llength $cl_srcs] source file(s) for static synthesis"
-    read_verilog -sv $cl_srcs
-} else {
-    read_verilog -sv [glob ${CL_DIR}/design/*.{s,}v]
+    close $fh
+    read_xdc $keep_xdc
+    set_property USED_IN {synthesis} [get_files $keep_xdc]
 }
 
 #---- End of section replaced by User ----
@@ -286,18 +258,13 @@ synth_design -mode out_of_context \
 # eval [concat synth_design -top $CL_MODULE -verilog_define XSDB_SLV_DIS $VDEFINES -part [DEVICE_TYPE] -mode out_of_context $synth_options -directive $synth_directive]
 
 if {[pr_enabled]} {
-    # Confirm the RM is a black box and record where it landed: the user XDC's
-    # HD.RECONFIGURABLE/pblock lines must match, and main_pr_rm.tcl reads it back.
+    # Record the RM path for later passes, then empty it: the RM is linked in from its OOC checkpoint.
     set pr_paths [pr_discover_paths $pr_module_names]
-    pr_assert_blackbox $pr_paths
-    pr_report_paths    $pr_paths
-
+    pr_report_paths $pr_paths
     pr_write_paths ${CL_DIR}/build/checkpoints/${CL}.pr_partition_paths.txt \
                    $pr_module_names $pr_paths
-
-    puts "PR: NOTE -- failfast.csv below cannot see the RM (black box at"
-    puts "PR: synthesis), so AWS's over-utilization gate under-counts. RM area"
-    puts "PR: is checked against its pblock during implementation instead."
+    set_property DONT_TOUCH false [get_cells $pr_paths]
+    update_design -cell $pr_paths -black_box
 }
 
 set failval [catch {exec grep "FAIL" failfast.csv}]
@@ -320,18 +287,14 @@ report_control_sets -verbose -file $CL_DIR/build/reports/${timestamp}.post_synth
 # Common footer
 source ${HDK_SHELL_DIR}/build/scripts/synth_cl_footer.tcl
 
-# ---- RM out-of-context synthesis (DFX) ----
-# The footer closed the CL project, so start a fresh in-memory one. Mirrors the
-# per-RM synthesis the article runs before the first configuration; project-mode
-# U250 gets this free from create_reconfig_module.
+# Out-of-context RM synthesis (the footer closed the CL project).
 if {[pr_enabled]} {
     foreach mod [pr_split [pr_env FIRESIM_PR_MODULE_NAME]] {
         puts "PR: out-of-context synthesis of RM '$mod'"
         create_project -in_memory -part $DEVICE_TYPE -force
         set_property XPM_LIBRARIES {XPM_CDC XPM_MEMORY XPM_FIFO} [current_project]
         read_verilog -sv [glob -nocomplain -directory ${CL_DIR}/design/split-verilog *.sv]
-        # OOC timing must come from an xdc read with -mode out_of_context; an
-        # inline create_clock cannot work, as no ports exist before synth_design.
+        # OOC clock must come from an -mode out_of_context xdc (no ports before synth).
         set ooc_xdc ${CL_DIR}/build/pr_stubs/${mod}_ooc.xdc
         set ooc_fh [open $ooc_xdc w]
         puts $ooc_fh "create_clock -name user_clock -period [expr {1000.0 / [pr_env FIRESIM_PR_FREQUENCY 35]}] \[get_ports clock\]"
@@ -346,17 +309,13 @@ if {[pr_enabled]} {
     }
 }
 
-# The outer AWS partition must contain a complete CL for its first routed
-# configuration. Assemble independently synthesized RMs into the static CL,
-# preserving their RTL interfaces through outer-RP implementation. The child
-# becomes HD.RECONFIGURABLE only when main_pr_subdivide.tcl subdivides CL.
+# Pass 1 implements a complete CL: link the OOC RM into the static netlist.
+# The RM becomes HD.RECONFIGURABLE later, in main_pr_subdivide.tcl.
 if {[pr_enabled] && [pr_env FIRESIM_PR_NESTED_PARENT 0] eq "1"} {
     set static_dcp ${checkpoints_dir}/${CL}.${TAG}.post_synth.dcp
     set static_only_dcp ${checkpoints_dir}/${CL}.${TAG}.static_post_synth.dcp
     file copy -force $static_dcp $static_only_dcp
-    # Assemble with scoped netlist linking. In Vivado 2025.2, direct
-    # read_checkpoint -cell into this OOC CL checkpoint returns Project 1-9.
-    # Linking preserves the OOC mode inherited from the static checkpoint.
+    # Scoped link: read_checkpoint -cell into this OOC checkpoint fails (Project 1-9).
     create_project -in_memory -part $DEVICE_TYPE -force
     lassign [pr_read_paths ${CL_DIR}/build/checkpoints/${CL}.pr_partition_paths.txt] \
         pr_module_names pr_paths
@@ -368,17 +327,7 @@ if {[pr_enabled] && [pr_env FIRESIM_PR_NESTED_PARENT 0] eq "1"} {
     }
     add_files $static_only_dcp
     link_design -top cl_firesim -part $DEVICE_TYPE
-    # BOOTFIX: with the RM black-boxed during static synthesis, synth_design skips
-    # loading calibration_ddr.elf into the DDR calibration MicroBlaze BRAMs (no
-    # "Memdata 28-144"; AWS check_ddr_bram.tcl: "MiG BRAM is not populated ...
-    # Calibration Failure"), and link_design of DCPs does not populate them
-    # either (trial bf1b). The DDR then never calibrates, ddr_ready stays 0 and
-    # firesim_top is held in reset (driver hangs in wait_for_init). Replay the
-    # INIT/INITP values the ELF produces (taken from the booting flat build; same
-    # AWS cl_ddr4 IP and ELF; validated by trial bf4_mig_init_replay).
-    source ${CL_DIR}/build/scripts/mig_calib_bram_init.tcl
-    pr_apply_mig_bram_init
-    pr_require_mig_bram "assembled outer-CL netlist"
+    pr_check_ddr_bram
     foreach path $pr_paths {
         set_property DONT_TOUCH true [get_cells $path]
         if {[get_property IS_BLACKBOX [get_cells $path]]} {

@@ -1,24 +1,5 @@
-# =============================================================================
-# Nested-DFX RP region selection (AWS F2). Pick the clock-region rectangle for the
-# prefetcher RP from where the module actually places, instead of a fixed default.
-#
-# Run on a PLACED reference design that holds the RM unconstrained (e.g. the flat
-# inline build of the same target config):
-#
-#   source pr_derive_region.tcl
-#   set region [pr_derive_region $rp_path {lut 3000 ff 3000 lutram 64 bram 0 dsp 0}]
-#
-# Returns "CLOCKREGION_XaYb:CLOCKREGION_XcYd" and prints the ranking. Feed it to the
-# base build as recipe platform_config_args.pr_region (-> FIRESIM_PR_NESTED_REGION).
-#
-# needs = resources of the LARGEST RM the base must host. Every candidate must:
-#   - be a rectangle of clock regions in one SLR, inside pblock_CL (AWS CL area)
-#   - hold no shell cell and no SH_DDR cell (same rules as pr_check_seed_region)
-#   - have >= min_slices slice sites and capacity >= margin x needs
-# Ranking: smallest first, then most RM cells already inside, then nearest to the
-# centroid of the RM's static neighbours (low-fanout data nets only; clocks/resets
-# would pull the centroid everywhere).
-# =============================================================================
+# Pick the RP clock-region rectangle from where the RM places in an unconstrained placed design:
+# smallest legal rectangle (one SLR, inside pblock_CL, no shell/DDR, capacity >= margin x needs).
 
 proc pr_cr_xy {cr} {
     if {[regexp {^X(\d+)Y(\d+)$} $cr -> x y]} { return [list $x $y] }
@@ -45,6 +26,21 @@ proc pr_region_capacity {crs allowed} {
         incr ds [llength [get_sites -quiet -of_objects $crobj -filter {SITE_TYPE == DSP48E2}]]
     }
     return [list $sl $sm $br $ds $bad $out [dict size $slrs]]
+}
+
+# Resource needs of an RP's current netlist, in pr_derive_region's needs format.
+proc pr_rm_needs {rp} {
+    set cells [get_cells -quiet -hierarchical -filter "IS_PRIMITIVE && NAME =~ $rp/*"]
+    set n [dict create lut 0 ff 0 lutram 0 bram 0 dsp 0]
+    foreach ref [get_property REF_NAME $cells] {
+        if {[string match LUT* $ref]} { dict incr n lut
+        } elseif {[string match FD* $ref]} { dict incr n ff
+        } elseif {[string match RAMB36* $ref]} { dict incr n bram
+        } elseif {[string match RAMB18* $ref]} { dict set n bram [expr {[dict get $n bram] + 0.5}]
+        } elseif {[string match RAM* $ref]} { dict incr n lutram
+        } elseif {[string match DSP* $ref]} { dict incr n dsp }
+    }
+    return $n
 }
 
 proc pr_derive_region {rp needs {margin 3.0} {min_slices 3000} {max_crs 4}} {
@@ -121,4 +117,14 @@ proc pr_derive_region {rp needs {margin 3.0} {min_slices 3000} {max_crs 4}} {
     set pick [lindex $best_sorted 0 3]
     puts "PR_REGION $pick"
     return $pick
+}
+
+# Standalone (pr_seed_reservation.tcl): vivado -source pr_derive_region.tcl -tclargs <unplaced.dcp> <rp> <out_file>
+if {[info exists argv] && [llength $argv] == 3 && ![llength [get_designs -quiet]]} {
+    lassign $argv dcp rp out_file
+    open_checkpoint $dcp
+    opt_design
+    place_design -directive Quick
+    set region [pr_derive_region $rp [pr_rm_needs $rp]]
+    set fh [open $out_file w]; puts $fh $region; close $fh
 }

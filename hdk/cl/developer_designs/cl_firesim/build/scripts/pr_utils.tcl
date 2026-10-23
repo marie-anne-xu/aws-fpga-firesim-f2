@@ -1,14 +1,7 @@
-# =============================================================================
-# FireSim partial reconfiguration (DFX) utilities -- AWS F2.
-# Non-project-mode counterpart of the U250 flow in
-# platforms/xilinx_alveo_u250/cl_firesim/scripts/.
-#
-# WRAPPER/CL is already AWS's DFX partition, so an RM inside it is nested DFX.
-# No local write_bitstream on F2: every flow ends in write_checkpoint.
-# HD.RECONFIGURABLE + pblock live in the user XDC (build_level_1_cl.tcl:56).
-# =============================================================================
+# FireSim nested-DFX helpers for AWS F2. WRAPPER/CL is already AWS's partition,
+# so the prefetcher RP nests inside it; every flow ends in a routed checkpoint.
 
-# Env plumbing for the parent flow; platforms/f2/build-bitstream.sh exports these.
+# Env set by platforms/f2/build-bitstream.sh.
 proc pr_env {name {default ""}} {
     if {[info exists ::env($name)]} {
         return $::env($name)
@@ -31,8 +24,7 @@ proc pr_split {s} {
     return $out
 }
 
-# Named-option tclargs parsing for the child flows, whose vivado calls we own.
-#   set opts [pr_parse_args $argv {cl_dir build_tag} {device_type}]
+# Named --option tclargs: pr_parse_args $argv {required ...} {optional ...}
 proc pr_parse_args {arglist required {optional {}}} {
     set opts [dict create]
     set n [llength $arglist]
@@ -67,8 +59,7 @@ proc pr_opt {opts key {default ""}} {
     return $default
 }
 
-# Partition discovery. The Golden Gate path shifts between elaborations, so
-# derive it rather than guess. Mirrors U250 post_synth_pr.tcl:13.
+# The RM instance path changes between elaborations, so find it by module name.
 proc pr_discover_paths {module_names} {
     set paths {}
     foreach mod $module_names {
@@ -82,51 +73,6 @@ proc pr_discover_paths {module_names} {
         }
     }
     return $paths
-}
-
-# Vivado errors on a missing module ([Synth 8-439]) rather than inferring a black
-# box, so the withheld RM needs an empty stub carrying its real port list.
-proc pr_write_stub {src_sv module out_file} {
-    if {![file exists $src_sv]} { error "PR: cannot make a stub, no such file: $src_sv" }
-    set fh [open $src_sv r]
-    set lines {}
-    set started 0
-    while {[gets $fh line] >= 0} {
-        if {!$started} {
-            if {[regexp "^module\\s+${module}\\s*\\(" $line]} { set started 1 } else { continue }
-        }
-        lappend lines $line
-        if {[regexp {^\s*\)\s*;} $line]} { break }
-    }
-    close $fh
-    if {!$started} { error "PR: no 'module $module(' declaration found in $src_sv" }
-    if {![regexp {^\s*\)\s*;} [lindex $lines end]]} {
-        error "PR: port declaration for '$module' was not terminated in $src_sv"
-    }
-    set oh [open $out_file w]
-    puts $oh "// Auto-generated DFX black-box stub for $module -- do not edit."
-    puts $oh "(* black_box *)"
-    foreach l $lines { puts $oh $l }
-    puts $oh "endmodule"
-    close $oh
-    puts "PR: wrote black-box stub ([llength $lines] port lines) -> $out_file"
-    return $out_file
-}
-
-# A cell is only an RP if synthesis left it a black box, i.e. its RTL was withheld.
-proc pr_assert_blackbox {paths} {
-    foreach path $paths {
-        set cell [get_cells $path -quiet]
-        if {$cell eq ""} {
-            error "PR: partition path not found in design: $path"
-        }
-        if {![get_property IS_BLACKBOX $cell]} {
-            error "PR: '$path' is not a black box -- its RTL was included in the\
-                   static synthesis. Check that the RM .sv is excluded from the\
-                   read_verilog list in synth_cl_firesim.tcl."
-        }
-    }
-    puts "PR: all [llength $paths] partition(s) are black boxes"
 }
 
 # The user XDC's HD.RECONFIGURABLE and pblock lines must name these exactly.
@@ -167,11 +113,8 @@ proc pr_read_paths {path_file} {
     return [list $modules $paths]
 }
 
-# Route-completeness gate, parsed from report_route_status (the same counts the
-# validated nested trial was gated on). A per-net ROUTE_STATUS scan is not used:
-# in an abstract-shell (nested container) design it reports hierarchical
-# segments that report_route_status does not count. Zero-count lines are
-# omitted from the report, so a missing line means zero.
+# Fail on routing errors/unrouted nets. Uses report_route_status: per-net ROUTE_STATUS
+# over-reports hierarchical segments in a nested design. Missing line = zero.
 proc pr_check_routed {label} {
     puts "PR: route status after ${label}:"
     set st [report_route_status -ignore_cache -return_string]
@@ -187,7 +130,7 @@ proc pr_check_routed {label} {
     puts "PR: fully routed after ${label}"
 }
 
-# Setup and hold must both close; a nested base that misses timing is not shipped.
+# Setup and hold must both close before shipping.
 proc pr_check_timing_met {label} {
     set wns [get_property SLACK [get_timing_paths -max_paths 1 -nworst 1 -setup]]
     set whs [get_property SLACK [get_timing_paths -max_paths 1 -nworst 1 -hold]]
@@ -216,16 +159,12 @@ proc pr_check_hdpr_drc {label rpt} {
     puts "PR: ${label} HDPR DRC clean ($rpt)"
 }
 
-# Nested child region. The validated base (trial g9_cell_const_unroute) uses two
-# whole clock regions in SLR0. FIRESIM_PR_NESTED_REGION overrides it.
-# platforms/f2/build-bitstream.sh still exports the superseded SLR2 default as
-# PR_PBLOCK_REGION, so that variable does not choose the nested-parent region.
+# Nested RP region: two SLR0 clock regions unless FIRESIM_PR_NESTED_REGION is set.
 proc pr_nested_region {} {
     return [pr_env FIRESIM_PR_NESTED_REGION {CLOCKREGION_X1Y0:CLOCKREGION_X2Y0}]
 }
 
-# Pass-1 guard on the child reservation: the slices must lie inside pblock_CL,
-# within one SLR, and must not hold shell or SH_DDR cells.
+# The reserved RP region must be inside pblock_CL, in one SLR, and free of shell/DDR cells.
 proc pr_check_seed_region {pblock {min_slices 3000}} {
     set pb [get_pblocks $pblock]
     set allowed [dict create]
@@ -248,8 +187,7 @@ proc pr_check_seed_region {pblock {min_slices 3000}} {
     puts "PR seed: region guard passed: slices=$n slr=[dict keys $slrs] ranges=[get_property GRID_RANGES $pb]"
 }
 
-# Give constant RM output bits distinct preserved drivers (UG909 unique-driver
-# requirement). Run on the standalone OOC RM before writing its checkpoint.
+# DFX needs a unique driver per RM output: give constant outputs their own LUT1 (OOC RM only).
 proc pr_fix_constant_output_drivers {} {
     set index 0
     foreach port [get_ports -filter {DIRECTION == OUT}] {
@@ -274,19 +212,8 @@ proc pr_fix_constant_output_drivers {} {
     return $index
 }
 
-# BOOTFIX gate: same cell/property as AWS check_ddr_bram.tcl, but fatal.
-proc pr_require_mig_bram {label {fatal 1}} {
-    set ram [get_cells -quiet -hierarchical -filter {NAME=~*mcs0/inst/lmb_bram_I/U0/inst_blk_mem_gen/gnbram.gnative_mem_map_bmg.native_mem_map_blk_mem_gen/valid.cstr/ramloop[0].ram.r/prim_noinit.ram/DEVICE_8SERIES.WITH_BMM_INFO.TRUE_DP.SIMPLE_PRIM36.SERIES8_TDP_SP36_NO_ECC_ATTR.ram}]
-    if {[llength $ram] == 0} { error "PR: $label: DDR calibration BRAM not found" }
-    set v [get_property INIT_2C [lindex $ram 0]]
-    regsub -all {[0-9]+'h} $v {} hex
-    if {![regexp {[1-9a-fA-F]} $hex]} {
-        set msg "PR: $label: MiG BRAM not populated with calibration_ddr.elf (INIT_2C=$v); DDR would not calibrate on F2"
-        if {$fatal} { error $msg }
-        puts "CRITICAL WARNING: $msg"
-        return 0
-    }
-    puts "PR: $label: MiG BRAM is initialized. INIT_2C = $v"
-    return 1
+# AWS's DDR calibration BRAM check; supplies AWS's print proc outside build_all.tcl.
+proc pr_check_ddr_bram {} {
+    if {![llength [info procs ::print]]} { proc ::print {m} { puts "AWS FPGA: $m" } }
+    uplevel #0 [list source [pr_env HDK_SHELL_DIR]/build/scripts/check_ddr_bram.tcl]
 }
-

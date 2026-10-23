@@ -1,13 +1,11 @@
-# Static checkpoint reuse helpers. Full nested implementation validation is in progress.
+# Pass 1: find static hierarchies next to the RP that must keep their interfaces.
 proc pr_reuse_one {path} {
     set literal [string map [list \\ \\\\ \" \\\"] $path]
     set cells [get_cells -hierarchical -quiet -filter [format {NAME == "%s"} $literal]]
     if {[llength $cells] != 1} {error "PR reuse: expected exactly one cell: $path"}
     return [lindex $cells 0]
 }
-# Imported checkpoints can retain only a subset of source placement. The
-# pre-placement phases permit this, but require the native PHY and the complete
-# previously failing RAM/FF groups. Source and post-place phases remain complete.
+# The preserved hierarchies must not overlap the RP.
 proc pr_reuse_guard_static {paths child} {
     foreach path $paths {
         pr_reuse_one $path
@@ -17,9 +15,7 @@ proc pr_reuse_guard_static {paths child} {
     }
 }
 
-# Discover disjoint static sibling hierarchies along the child ancestor chain.
-# Select distributed-memory branches; BRAM-only branches are not affected by
-# the observed LUTRAM/FF placement shapes. This matches the source inventory.
+# Static siblings along the RP's ancestor chain that contain LUTRAM (their placement must be kept).
 proc pr_reuse_memory_branches {container child} {
     if {[string first ${container}/ $child] != 0} {error "PR reuse: child outside container"}
     set ancestors [dict create]
@@ -47,8 +43,7 @@ proc pr_reuse_memory_branches {container child} {
     foreach root [lsort [dict keys $roots]] {
         if {[dict get $roots $root] > 0} {lappend selected $root}
     }
-    # Import MIG last: importing other checkpoints after it invalidated MIG
-    # IO placement in the earlier converter/DDR assembly trial.
+    # SH_DDR last.
     set ddr ${container}/SH_DDR
     set index [lsearch -exact $selected $ddr]
     if {$index >= 0} {set selected [lreplace $selected $index $index]; lappend selected $ddr}
