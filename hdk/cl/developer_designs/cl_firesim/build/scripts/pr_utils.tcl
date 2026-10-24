@@ -1,5 +1,4 @@
-# FireSim nested-DFX helpers for AWS F2. WRAPPER/CL is already AWS's partition,
-# so the prefetcher RP nests inside it; every flow ends in a routed checkpoint.
+# FireSim prefetcher-swap helpers for AWS F2 (RapidWright shell flow).
 
 # Env set by platforms/f2/build-bitstream.sh.
 proc pr_env {name {default ""}} {
@@ -75,16 +74,6 @@ proc pr_discover_paths {module_names} {
     return $paths
 }
 
-# The user XDC's HD.RECONFIGURABLE and pblock lines must name these exactly.
-proc pr_report_paths {paths} {
-    puts "PR: ============================================================"
-    puts "PR: partition path(s) -- these must match the XDC exactly:"
-    foreach path $paths {
-        puts "PR:   $path"
-    }
-    puts "PR: ============================================================"
-}
-
 proc pr_write_paths {path_file module_names paths} {
     set fh [open $path_file w]
     for {set i 0} {$i < [llength $paths]} {incr i} {
@@ -113,8 +102,7 @@ proc pr_read_paths {path_file} {
     return [list $modules $paths]
 }
 
-# Fail on routing errors/unrouted nets. Uses report_route_status: per-net ROUTE_STATUS
-# over-reports hierarchical segments in a nested design. Missing line = zero.
+# Fail on routing errors/unrouted nets (report_route_status; missing line = zero).
 proc pr_check_routed {label} {
     puts "PR: route status after ${label}:"
     set st [report_route_status -ignore_cache -return_string]
@@ -140,76 +128,6 @@ proc pr_check_timing_met {label} {
             error "PR: ${label} fails timing ($name=$v)"
         }
     }
-}
-
-# DFX DRC gate: fail on any HDPR rule reported at Error or Critical Warning.
-proc pr_check_hdpr_drc {label rpt} {
-    set checks [get_drc_checks -quiet HDPR-*]
-    if {![llength $checks]} { error "PR: no HDPR DRC checks available" }
-    set txt [report_drc -checks $checks -return_string]
-    set fh [open $rpt w]; puts $fh $txt; close $fh
-    set bad {}
-    foreach line [split $txt "\n"] {
-        if {[regexp {^\|\s*(HDPR-\d+)\s*\|\s*([^|]*?)\s*\|.*\|\s*(\d+)\s*\|\s*$} $line -> rule sev n]} {
-            puts "PR: ${label} DRC $rule ($sev): $n"
-            if {$n > 0 && [regexp -nocase {error|critical} $sev]} { lappend bad "$rule=$n" }
-        }
-    }
-    if {[llength $bad]} { error "PR: ${label} HDPR DRC violations: $bad (see $rpt)" }
-    puts "PR: ${label} HDPR DRC clean ($rpt)"
-}
-
-# Nested RP region: two SLR0 clock regions unless FIRESIM_PR_NESTED_REGION is set.
-proc pr_nested_region {} {
-    return [pr_env FIRESIM_PR_NESTED_REGION {CLOCKREGION_X1Y0:CLOCKREGION_X2Y0}]
-}
-
-# The reserved RP region must be inside pblock_CL, in one SLR, and free of shell/DDR cells.
-proc pr_check_seed_region {pblock {min_slices 3000}} {
-    set pb [get_pblocks $pblock]
-    set allowed [dict create]
-    foreach site [get_sites -of_objects [get_pblocks pblock_CL]] {dict set allowed [get_property NAME $site] 1}
-    set slrs [dict create]
-    set n 0
-    foreach site [get_sites -of_objects $pb -filter {SITE_TYPE =~ SLICE*}] {
-        set name [get_property NAME $site]
-        incr n
-        if {![dict exists $allowed $name]} { error "PR seed: region leaves the AWS CL at $name" }
-        dict set slrs [get_property NAME [get_slrs -of_objects $site]] 1
-        foreach occupant [get_cells -quiet -of_objects $site] {
-            set o [get_property NAME $occupant]
-            if {![string match WRAPPER/CL/* $o]} { error "PR seed: region overlaps shell cell $o" }
-            if {[string match WRAPPER/CL/SH_DDR/* $o]} { error "PR seed: region overlaps DDR cell $o" }
-        }
-    }
-    if {[dict size $slrs] != 1} { error "PR seed: region spans SLRs [dict keys $slrs]" }
-    if {$n < $min_slices} { error "PR seed: region has only $n slice sites (< $min_slices)" }
-    puts "PR seed: region guard passed: slices=$n slr=[dict keys $slrs] ranges=[get_property GRID_RANGES $pb]"
-}
-
-# DFX needs a unique driver per RM output: give constant outputs their own LUT1 (OOC RM only).
-proc pr_fix_constant_output_drivers {} {
-    set index 0
-    foreach port [get_ports -filter {DIRECTION == OUT}] {
-        set net [get_nets -quiet -of_objects $port]
-        set drivers [get_pins -quiet -leaf -of_objects $net -filter {DIRECTION == OUT}]
-        if {[llength $drivers] != 1} {continue}
-        set ref [get_property REF_NAME [get_cells -of_objects $drivers]]
-        if {$ref ni {GND VCC}} {continue}
-        set name dfx_output_constant_$index
-        if {[llength [get_cells -quiet $name]]} {error "PR: reserved output driver name already exists: $name"}
-        create_cell -reference LUT1 $name
-        set_property INIT [expr {$ref eq "GND" ? "2'h0" : "2'h3"}] [get_cells $name]
-        set_property DONT_TOUCH true [get_cells $name]
-        connect_net -net $net -objects [get_pins $name/I0]
-        disconnect_net -net $net -objects $port
-        create_net ${name}_net
-        connect_net -net [get_nets ${name}_net] -objects [list $port [get_pins $name/O]]
-        puts "PR: unique constant output driver: $port -> $name/O ($ref)"
-        incr index
-    }
-    puts "PR: created $index distinct constant RM output drivers"
-    return $index
 }
 
 # AWS's DDR calibration BRAM check; supplies AWS's print proc outside build_all.tcl.

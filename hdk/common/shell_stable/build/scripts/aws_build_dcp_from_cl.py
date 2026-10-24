@@ -108,7 +108,7 @@ def generate_manifest_file(tag, tar_dir, manifest):
 #############################################################
 # Generate DCP tarball file
 #############################################################
-def generate_dcp_tarball(cl, tag, clock_recipe_a, clock_recipe_b, clock_recipe_c, clock_recipe_hbm, *, dcp_path=None):
+def generate_dcp_tarball(cl, tag, clock_recipe_a, clock_recipe_b, clock_recipe_c, clock_recipe_hbm):
     dcp_name = cl + "." + tag + ".post_route.dcp"
     dcp_violated_name = cl + "." + tag + ".post_route.VIOLATED.dcp"
     probe_name = tag + ".debug_probes.ltx"
@@ -116,12 +116,6 @@ def generate_dcp_tarball(cl, tag, clock_recipe_a, clock_recipe_b, clock_recipe_c
     dcp_file = os.path.join(checkpoints_dir, dcp_name)
     dcp_violated_file = os.path.join(checkpoints_dir, dcp_violated_name)
     probe_file = os.path.join(checkpoints_dir, probe_name)
-    # Keep the nested base; package its separate recombined outer-CL export.
-    if dcp_path is not None:
-        dcp_file = os.path.abspath(dcp_path)
-        if not os.path.isfile(dcp_file):
-            raise FileNotFoundError(dcp_file)
-    use_violated = dcp_path is None and os.path.exists(dcp_violated_file)
 
     if os.path.exists("to_aws"):
         now = datetime.datetime.now()
@@ -130,10 +124,10 @@ def generate_dcp_tarball(cl, tag, clock_recipe_a, clock_recipe_b, clock_recipe_c
         print(f"Save the existing to_aws/ to to_aws_backup_{surfix}/")
     os.mkdir("to_aws")
 
-    if use_violated or os.path.exists(dcp_file):
+    if os.path.exists(dcp_violated_file) or os.path.exists(dcp_file):
         manifest = get_pcie_ids()
         manifest["manifest_format_version"] = 2
-        if use_violated:
+        if os.path.exists(dcp_violated_file):
             print_warning("\nDetected a post-route DCP with timing failure for AFI creation. Design functionalities are NOT guranteed.\n")
             os.system(f"cp {dcp_violated_file} ./to_aws/{tag}.SH_CL_routed.dcp")
             manifest["dcp_hash"] = get_cmd_output(f"sha256sum {dcp_violated_file}").split()[0]

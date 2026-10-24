@@ -60,8 +60,7 @@ puts "AWS FPGA: ([clock format [clock seconds] -format %T]) Reading developer's 
 source ${CL_DIR}/build/scripts/pr_utils.tcl
 read_verilog -sv [glob ${CL_DIR}/design/*.{s,}v]
 if {[pr_enabled]} {
-    # Synthesize the base RM in place so synth loads calibration_ddr.elf into the DDR
-    # calibration BRAMs (it skips this with a black box); the RM is black-boxed afterwards.
+    # RapidWright shell flow step 1: keep the RM hierarchy and pins (DONT_TOUCH).
     set pr_module_names [pr_split [pr_env FIRESIM_PR_MODULE_NAME]]
     if {[llength $pr_module_names] == 0} {
         error "PR: FIRESIM_PR_MODULE_NAME must name the reconfigurable module"
@@ -258,13 +257,9 @@ synth_design -mode out_of_context \
 # eval [concat synth_design -top $CL_MODULE -verilog_define XSDB_SLV_DIS $VDEFINES -part [DEVICE_TYPE] -mode out_of_context $synth_options -directive $synth_directive]
 
 if {[pr_enabled]} {
-    # Record the RM path for later passes, then empty it: the RM is linked in from its OOC checkpoint.
-    set pr_paths [pr_discover_paths $pr_module_names]
-    pr_report_paths $pr_paths
+    # Record the RM path for children.
     pr_write_paths ${CL_DIR}/build/checkpoints/${CL}.pr_partition_paths.txt \
-                   $pr_module_names $pr_paths
-    set_property DONT_TOUCH false [get_cells $pr_paths]
-    update_design -cell $pr_paths -black_box
+                   $pr_module_names [pr_discover_paths $pr_module_names]
 }
 
 set failval [catch {exec grep "FAIL" failfast.csv}]
@@ -287,54 +282,3 @@ report_control_sets -verbose -file $CL_DIR/build/reports/${timestamp}.post_synth
 # Common footer
 source ${HDK_SHELL_DIR}/build/scripts/synth_cl_footer.tcl
 
-# Out-of-context RM synthesis (the footer closed the CL project).
-if {[pr_enabled]} {
-    foreach mod [pr_split [pr_env FIRESIM_PR_MODULE_NAME]] {
-        puts "PR: out-of-context synthesis of RM '$mod'"
-        create_project -in_memory -part $DEVICE_TYPE -force
-        set_property XPM_LIBRARIES {XPM_CDC XPM_MEMORY XPM_FIFO} [current_project]
-        read_verilog -sv [glob -nocomplain -directory ${CL_DIR}/design/split-verilog *.sv]
-        # OOC clock must come from an -mode out_of_context xdc (no ports before synth).
-        set ooc_xdc ${CL_DIR}/build/pr_stubs/${mod}_ooc.xdc
-        set ooc_fh [open $ooc_xdc w]
-        puts $ooc_fh "create_clock -name user_clock -period [expr {1000.0 / [pr_env FIRESIM_PR_FREQUENCY 35]}] \[get_ports clock\]"
-        close $ooc_fh
-        read_xdc -mode out_of_context $ooc_xdc
-        synth_design -mode out_of_context -top $mod -part $DEVICE_TYPE -keep_equivalent_registers
-        pr_fix_constant_output_drivers
-        set rm_dcp ${checkpoints_dir}/${mod}.${TAG}.rm_post_synth.dcp
-        write_checkpoint -force $rm_dcp
-        puts "PR: wrote RM checkpoint -> $rm_dcp"
-        close_project
-    }
-}
-
-# Pass 1 implements a complete CL: link the OOC RM into the static netlist.
-# The RM becomes HD.RECONFIGURABLE later, in main_pr_subdivide.tcl.
-if {[pr_enabled] && [pr_env FIRESIM_PR_NESTED_PARENT 0] eq "1"} {
-    set static_dcp ${checkpoints_dir}/${CL}.${TAG}.post_synth.dcp
-    set static_only_dcp ${checkpoints_dir}/${CL}.${TAG}.static_post_synth.dcp
-    file copy -force $static_dcp $static_only_dcp
-    # Scoped link: read_checkpoint -cell into this OOC checkpoint fails (Project 1-9).
-    create_project -in_memory -part $DEVICE_TYPE -force
-    lassign [pr_read_paths ${CL_DIR}/build/checkpoints/${CL}.pr_partition_paths.txt] \
-        pr_module_names pr_paths
-    foreach mod $pr_module_names path $pr_paths {
-        set rm_dcp ${checkpoints_dir}/${mod}.${TAG}.rm_post_synth.dcp
-        puts "PR: assembling independently synthesized '$mod' at '$path'"
-        add_files $rm_dcp
-        set_property SCOPED_TO_CELLS [list $path] [get_files $rm_dcp]
-    }
-    add_files $static_only_dcp
-    link_design -top cl_firesim -part $DEVICE_TYPE
-    pr_check_ddr_bram
-    foreach path $pr_paths {
-        set_property DONT_TOUCH true [get_cells $path]
-        if {[get_property IS_BLACKBOX [get_cells $path]]} {
-            error "PR: RM assembly left '$path' as a black box"
-        }
-    }
-    write_checkpoint -force $static_dcp
-    close_project
-    puts "PR: populated outer-CL synthesis checkpoint: $static_dcp"
-}
